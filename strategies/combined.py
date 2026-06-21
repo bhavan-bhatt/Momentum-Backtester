@@ -1,177 +1,182 @@
 # strategies/combined.py
 # ============================================================
-# COMBINED STRATEGY — MA TREND FILTER + RSI ENTRY + VOL SIZING
-#
-# Logic
-# -----
-# 1. TREND FILTER (when trend_filter_enabled=True):
-#    Only permit LONG entries when fast MA > slow MA (uptrend).
-#
-# 2. RSI ENTRY (mean-reversion within a trend):
-#    Enter LONG when RSI crosses back above the oversold level
-#    (same reversal logic as RSIStrategy, but gated by trend).
-#
-# 3. ATR EXIT (volatility-adjusted stop):
-#    Exit when close falls below: entry_price - atr_stop_multiplier × ATR.
-#    Also exit when RSI reaches overbought or MA death cross occurs.
-#
-# 4. SIGNAL STRENGTH:
-#    Strength is set to (1 - RSI/100) so deeply oversold entries get
-#    higher confidence weight (used for analysis; not sizing by default).
+# COMBINED STRATEGY: MA TREND FILTER + RSI ENTRY + ATR EXIT
+# Only takes RSI buy signals when the MA trend is upward.
+# Three-condition exit: RSI overbought, MA death cross, ATR stop.
 # ============================================================
 
 import logging
 from collections import deque
 from typing import Optional
 
-import numpy as np
-
 from engine.events import MarketEvent, SignalDirection
-from engine.strategy import Strategy, moving_average, rsi as compute_rsi, atr as compute_atr
-from engine.data_handler import DataHandler
+from engine.strategy import BaseStrategy
 from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
 
 
-class CombinedStrategy(Strategy):
+class CombinedStrategy(BaseStrategy):
     """
-    Three-layer strategy: MA trend filter + RSI entry + ATR/RSI exit.
+    Production-quality multi-signal strategy.
 
-    State tracked per symbol:
-      invested       : bool
-      entry_price    : float — price at which we entered.
-      entry_atr      : float — ATR at time of entry (for dynamic stop).
-      was_oversold   : bool  — RSI was below oversold threshold.
+    Entry (LONG)
+    ------------
+    Both conditions must be true simultaneously:
+      1. MA trend filter: fast_ma > slow_ma (we are in an uptrend).
+         Skipped if trend_filter_enabled=False.
+      2. RSI reversal: RSI was below oversold on prev bar AND has now
+         crossed back above the oversold threshold (Mode A entry).
+
+    Exit (EXIT_LONG) — first condition that fires wins
+    ---------------------------------------------------
+    A. RSI overbought : RSI > rsi_overbought (profit target).
+    B. Trend reversal : fast_ma crosses BELOW slow_ma (stop out).
+    C. ATR trailing   : close < entry_price - (atr_stop_multiplier × entry_ATR).
+
+    Signal Strength
+    ---------------
+    Computed as a blend of RSI depth and MA spread (see _calculate_signal_strength).
+    Logged and stored on the SignalEvent but not used for sizing by default.
+
+    Parameters (from StrategyConfig)
+    ----------------------------------
+    fast_ma_window, slow_ma_window, ma_type
+    rsi_period, rsi_oversold, rsi_overbought
+    atr_period, atr_stop_multiplier
+    trend_filter_enabled
     """
 
-    def __init__(
-        self,
-        config: BacktestConfig,
-        data_handler: DataHandler,
-        event_queue: deque,
-    ) -> None:
-        super().__init__(config, data_handler, event_queue)
+    def __init__(self, config: BacktestConfig, event_queue: deque) -> None:
+        super().__init__(config, event_queue)
+
         scfg = config.strategy
-        self._fast      = scfg.fast_ma_window
-        self._slow      = scfg.slow_ma_window
-        self._ma_type   = scfg.ma_type
-        self._rsi_p     = scfg.rsi_period
-        self._oversold  = scfg.rsi_oversold
-        self._overbought = scfg.rsi_overbought
-        self._atr_p     = scfg.atr_period
-        self._atr_mult  = scfg.atr_stop_multiplier
-        self._trend_on  = scfg.trend_filter_enabled
+        self.fast_window         = scfg.fast_ma_window
+        self.slow_window         = scfg.slow_ma_window
+        self.ma_type             = scfg.ma_type
+        self.rsi_period          = scfg.rsi_period
+        self.rsi_oversold        = scfg.rsi_oversold
+        self.rsi_overbought      = scfg.rsi_overbought
+        self.atr_period          = scfg.atr_period
+        self.atr_stop_multiplier = scfg.atr_stop_multiplier
+        self.trend_filter        = scfg.trend_filter_enabled
 
-        # Lookback: enough for slow MA + ATR warm-up
-        self._lookback  = max(self._slow, self._atr_p) * 3 + 2
+        # Per-symbol entry state for ATR trailing stop
+        self.entry_prices: dict = {}   # {symbol: float entry price}
+        self.entry_atr:    dict = {}   # {symbol: float ATR at entry}
 
-    @property
-    def strategy_id(self) -> str:
-        return (
-            f"Combined_{self._ma_type}{self._fast}_{self._slow}"
-            f"_RSI{self._rsi_p}_ATR{self._atr_p}"
-        )
+        # Warm-up requires the slowest indicator + extra buffer
+        self.required_bars = max(self.slow_window, self.rsi_period, self.atr_period) + 3
+        self.strategy_id   = "Combined_MA_RSI_ATR"
 
-    def calculate_signals(self, event: MarketEvent) -> None:
-        symbol = event.symbol
-        bars   = self._get_bars(symbol, self._lookback)
-        if bars is None:
+    def calculate_signals(self, event: MarketEvent, data_handler) -> None:
+        """
+        Evaluate MA+RSI entry and three-condition exit for this bar.
+
+        Parameters
+        ----------
+        event        : MarketEvent for one symbol.
+        data_handler : DataHandler to fetch historical bars.
+        """
+        bars = data_handler.get_latest_bars(event.symbol, self.required_bars)
+        if not self._has_enough_bars(bars, self.required_bars):
             return
 
-        close  = bars["close"]
-        has_hl = self._data.has_high_low.get(symbol, False)
+        prices = bars["close"]
 
-        # ── Compute indicators ───────────────────────────────────────────
-        fast_ma  = moving_average(close, self._fast, self._ma_type)
-        slow_ma  = moving_average(close, self._slow, self._ma_type)
-        rsi_s    = compute_rsi(close, self._rsi_p)
+        # ── Indicators ────────────────────────────────────────────────────
+        if self.ma_type == "SMA":
+            fast_ma = self._calculate_sma(prices, self.fast_window)
+            slow_ma = self._calculate_sma(prices, self.slow_window)
+        else:
+            fast_ma = self._calculate_ema(prices, self.fast_window)
+            slow_ma = self._calculate_ema(prices, self.slow_window)
 
+        rsi_series = self._calculate_rsi(prices, self.rsi_period)
+
+        has_hl  = data_handler.has_high_low.get(event.symbol, False)
         atr_val: Optional[float] = None
         if has_hl:
-            atr_s   = compute_atr(bars["high"], bars["low"], close, self._atr_p)
-            atr_now = atr_s.iloc[-1]
-            atr_val = None if np.isnan(atr_now) else float(atr_now)
+            atr_series = self._calculate_atr(
+                bars["high"], bars["low"], prices, self.atr_period
+            )
+            atr_val = self._get_latest_indicator_value(atr_series)
 
-        # Current values
-        fast_now  = fast_ma.iloc[-1]
-        slow_now  = slow_ma.iloc[-1]
-        fast_prev = fast_ma.iloc[-2] if len(fast_ma) >= 2 else np.nan
-        slow_prev = slow_ma.iloc[-2] if len(slow_ma) >= 2 else np.nan
-        rsi_now   = rsi_s.iloc[-1]
-        rsi_prev  = rsi_s.iloc[-2] if len(rsi_s) >= 2 else np.nan
-        close_now = float(close.iloc[-1])
+        # Current scalar values
+        fast_now = self._get_latest_indicator_value(fast_ma)
+        slow_now = self._get_latest_indicator_value(slow_ma)
+        rsi_now  = self._get_latest_indicator_value(rsi_series, lookback=1)
+        rsi_prev = self._get_latest_indicator_value(rsi_series, lookback=2)
 
-        # Guard NaN
-        if any(np.isnan(v) for v in [fast_now, slow_now, rsi_now]):
+        if None in (fast_now, slow_now, rsi_now, rsi_prev):
             return
 
-        invested = self._is_invested(symbol)
-        sym_state = self._state.setdefault(symbol, {
-            "invested": False,
-            "entry_price": 0.0,
-            "entry_atr": 0.0,
-            "was_oversold": False,
-        })
+        symbol    = event.symbol
+        is_uptrend = fast_now > slow_now
 
-        # ── Update oversold tracker ──────────────────────────────────────
-        if not np.isnan(rsi_now):
-            sym_state["was_oversold"] = rsi_now < self._oversold
+        # ── ENTRY LOGIC ───────────────────────────────────────────────────
+        if self._is_flat(symbol):
+            rsi_reversal = (rsi_prev < self.rsi_oversold <= rsi_now)
+            trend_ok     = (not self.trend_filter) or is_uptrend
 
-        # ── Trend filter: fast MA > slow MA means uptrend ────────────────
-        in_uptrend = fast_now > slow_now
+            if rsi_reversal and trend_ok:
+                strength = self._calculate_signal_strength(rsi_now, fast_now, slow_now)
+                self.entry_prices[symbol] = event.close
+                self.entry_atr[symbol]    = atr_val if atr_val is not None else event.close * 0.02
+                self._emit_signal(symbol, event.timestamp, SignalDirection.LONG, strength)
 
-        # ── ENTRY LOGIC ──────────────────────────────────────────────────
-        if not invested:
-            trend_ok = (not self._trend_on) or in_uptrend
-
-            if trend_ok:
-                # RSI reversal entry: RSI was below oversold, now crosses above
-                if (
-                    not np.isnan(rsi_prev)
-                    and rsi_prev < self._oversold
-                    and rsi_now >= self._oversold
-                ):
-                    strength = max(0.0, min(1.0, 1.0 - rsi_prev / 100.0))
-                    self._emit_signal(event, SignalDirection.LONG, strength)
-                    sym_state["invested"]    = True
-                    sym_state["entry_price"] = close_now
-                    sym_state["entry_atr"]   = atr_val if atr_val is not None else close_now * 0.02
-                    self._set_invested(symbol, True)
-
-        # ── EXIT LOGIC ───────────────────────────────────────────────────
-        else:
-            entry_price = sym_state.get("entry_price", 0.0)
-            entry_atr   = sym_state.get("entry_atr", 0.0)
-
+        # ── EXIT LOGIC ────────────────────────────────────────────────────
+        elif self._is_long(symbol):
             exit_triggered = False
+            reason         = ""
 
-            # 1. ATR stop-loss: price fell below entry - (multiplier × ATR)
-            if entry_atr > 0:
-                stop_level = entry_price - self._atr_mult * entry_atr
-                if close_now < stop_level:
-                    logger.debug(
-                        "[%s] ATR stop hit for %s: close=%.2f < stop=%.2f",
-                        self.strategy_id, symbol, close_now, stop_level,
-                    )
-                    exit_triggered = True
-
-            # 2. RSI overbought exit
-            if not exit_triggered and rsi_now >= self._overbought:
+            # Condition A — RSI overbought
+            if rsi_now > self.rsi_overbought:
                 exit_triggered = True
+                reason = "RSI_OB"
 
-            # 3. Trend reversal exit: MA death cross (trend filter must be enabled)
-            if not exit_triggered and self._trend_on:
-                if (
-                    not np.isnan(fast_prev) and not np.isnan(slow_prev)
-                    and fast_prev >= slow_prev
-                    and fast_now < slow_now
-                ):
+            # Condition B — MA death cross (trend reversal)
+            if not exit_triggered and self._crossed_below(fast_ma, slow_ma):
+                exit_triggered = True
+                reason = "MA_CROSS"
+
+            # Condition C — ATR trailing stop
+            if not exit_triggered and symbol in self.entry_prices:
+                entry_atr_val = self.entry_atr.get(symbol, atr_val or event.close * 0.02)
+                stop_price    = self.entry_prices[symbol] - (
+                    self.atr_stop_multiplier * entry_atr_val
+                )
+                if event.close < stop_price:
                     exit_triggered = True
+                    reason = "ATR_STOP"
 
             if exit_triggered:
-                self._emit_signal(event, SignalDirection.EXIT_LONG)
-                sym_state["invested"]    = False
-                sym_state["entry_price"] = 0.0
-                sym_state["entry_atr"]   = 0.0
-                self._set_invested(symbol, False)
+                logger.debug(
+                    "[%s] EXIT %s: reason=%s", self.strategy_id, symbol, reason
+                )
+                self.entry_prices.pop(symbol, None)
+                self.entry_atr.pop(symbol, None)
+                self._emit_signal(symbol, event.timestamp, SignalDirection.EXIT_LONG)
+
+    def _calculate_signal_strength(
+        self, rsi_now: float, fast_ma: float, slow_ma: float
+    ) -> float:
+        """
+        Compute a confidence score ∈ [0, 1].
+
+        RSI component  (weight 0.7):
+          Depth below the oversold level at time of reversal.
+          0 when RSI is exactly AT oversold; higher when deeper into oversold.
+
+        Trend component (weight 0.3, only when trend filter is on):
+          Normalised spread between fast and slow MA.
+          5% spread → full strength (1.0).
+        """
+        rsi_depth      = max(0.0, self.rsi_oversold - rsi_now) / self.rsi_oversold
+        trend_strength = 0.0
+        if self.trend_filter and slow_ma != 0:
+            ma_spread      = (fast_ma - slow_ma) / slow_ma
+            trend_strength = min(1.0, max(0.0, ma_spread * 20.0))
+
+        strength = 0.7 * rsi_depth + 0.3 * trend_strength
+        return float(max(0.0, min(1.0, strength)))

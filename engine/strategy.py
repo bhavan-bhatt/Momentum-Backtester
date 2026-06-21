@@ -1,9 +1,7 @@
 # engine/strategy.py
 # ============================================================
-# ABSTRACT STRATEGY BASE CLASS + STATELESS INDICATOR UTILITIES
-# All concrete strategies inherit from Strategy and implement
-# calculate_signals(). Indicators are pure functions that
-# accept pd.Series / pd.DataFrame and return pd.Series.
+# ABSTRACT BASE CLASS FOR ALL STRATEGIES
+# Provides shared indicator utility functions used by all strategy implementations.
 # ============================================================
 
 import logging
@@ -15,297 +13,303 @@ import numpy as np
 import pandas as pd
 
 from engine.events import MarketEvent, SignalEvent, SignalDirection
-from engine.data_handler import DataHandler
 from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STATELESS INDICATOR UTILITIES
-# All functions accept a pd.Series of prices (or DataFrame for multi-column
-# indicators) and return a pd.Series. No side-effects.
-# ══════════════════════════════════════════════════════════════════════════════
+class BaseStrategy(ABC):
+    """
+    Abstract base class that all strategies must inherit from.
+
+    Provides
+    --------
+    1. Abstract method calculate_signals() that every strategy must implement.
+    2. Protected indicator utility methods (SMA, EMA, RSI, ATR, crossover detection).
+    3. Position state tracking per symbol (strategy-level approximation only;
+       Portfolio is the authoritative source of truth for actual positions).
+
+    Internal State
+    --------------
+    self.current_positions : Dict[str, Optional[SignalDirection]]
+        {symbol: SignalDirection.LONG | SignalDirection.SHORT | None}
+        None means flat.
+    """
+
+    def __init__(self, config: BacktestConfig, event_queue: deque) -> None:
+        self._config      = config
+        self._event_queue = event_queue
+        self.strategy_id  = "BaseStrategy"
+        # Keyed by symbol; None = flat, SignalDirection = open direction
+        self.current_positions: dict = {}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ABSTRACT INTERFACE
+    # ──────────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def calculate_signals(self, event: MarketEvent, data_handler) -> None:
+        """
+        Core method — analyse the current bar and emit SignalEvents.
+
+        Contract
+        --------
+        - Receives a MarketEvent for ONE symbol at ONE timestamp.
+        - May call data_handler.get_latest_bars(event.symbol, N) to get history.
+        - If a trade signal is detected, calls self._emit_signal().
+        - MUST NOT look at future data.
+        - MUST NOT modify data_handler's internal state.
+
+        Parameters
+        ----------
+        event        : MarketEvent — the bar triggering this call.
+        data_handler : DataHandler — for fetching historical bars.
+        """
+        ...
+
+    # ──────────────────────────────────────────────────────────────────────
+    # SIGNAL EMISSION
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _emit_signal(
+        self,
+        symbol: str,
+        timestamp,
+        direction: SignalDirection,
+        strength: float = 1.0,
+    ) -> None:
+        """
+        Build a SignalEvent, update position state, and push into the event queue.
+
+        Parameters
+        ----------
+        symbol    : str
+        timestamp : datetime
+        direction : SignalDirection
+        strength  : float ∈ [0, 1]
+        """
+        signal = SignalEvent(
+            timestamp=timestamp,
+            symbol=symbol,
+            strategy_id=self.strategy_id,
+            direction=direction,
+            strength=max(0.0, min(1.0, strength)),
+        )
+        # Update strategy-level position tracking
+        if direction in (SignalDirection.LONG, SignalDirection.SHORT):
+            self.current_positions[symbol] = direction
+        elif direction in (SignalDirection.EXIT_LONG, SignalDirection.EXIT_SHORT):
+            self.current_positions[symbol] = None
+
+        self._event_queue.append(signal)
+        logger.debug(
+            "[%s] %s → %s @ %s (strength=%.2f)",
+            self.strategy_id, symbol, direction.value,
+            timestamp.date() if hasattr(timestamp, "date") else timestamp,
+            strength,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # POSITION STATE HELPERS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _is_flat(self, symbol: str) -> bool:
+        """True if no open position exists for this symbol."""
+        return self.current_positions.get(symbol) is None
+
+    def _is_long(self, symbol: str) -> bool:
+        """True if a LONG position is open for this symbol."""
+        return self.current_positions.get(symbol) == SignalDirection.LONG
+
+    def _is_short(self, symbol: str) -> bool:
+        """True if a SHORT position is open for this symbol."""
+        return self.current_positions.get(symbol) == SignalDirection.SHORT
+
+    def _has_enough_bars(self, bars: Optional[pd.DataFrame], required: int) -> bool:
+        """
+        Return True if bars is non-None and has at least `required` rows.
+        Always call this before computing indicators to avoid warm-up errors.
+        """
+        return bars is not None and len(bars) >= required
+
+    # ──────────────────────────────────────────────────────────────────────
+    # INDICATOR UTILITY FUNCTIONS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _calculate_sma(self, prices: pd.Series, window: int) -> pd.Series:
+        """Simple Moving Average. First (window-1) values are NaN."""
+        return prices.rolling(window=window, min_periods=window).mean()
+
+    def _calculate_ema(self, prices: pd.Series, window: int) -> pd.Series:
+        """Exponential Moving Average (span=window, adjust=False)."""
+        return prices.ewm(span=window, min_periods=window, adjust=False).mean()
+
+    def _calculate_rsi(self, prices: pd.Series, period: int) -> pd.Series:
+        """
+        RSI using Wilder's smoothing (EMA with alpha = 1/period).
+
+        Returns a Series in [0, 100]. First `period` values are NaN.
+        Handles the edge case of zero avg_loss (returns 100).
+        """
+        delta = prices.diff()
+        gains = delta.clip(lower=0)
+        losses = (-delta).clip(lower=0)
+
+        avg_gain = gains.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+        avg_loss = losses.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+        # Avoid division by zero: where avg_loss is 0, RS is infinite → RSI = 100
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        # Fill the zero-avg_loss edge case
+        rsi = rsi.where(avg_loss != 0, 100.0)
+        return rsi
+
+    def _calculate_atr(
+        self,
+        highs: pd.Series,
+        lows: pd.Series,
+        closes: pd.Series,
+        period: int,
+    ) -> pd.Series:
+        """
+        Average True Range using Wilder's smoothing (alpha = 1/period).
+
+        If highs or lows are entirely NaN (data tier 3), returns a Series of NaN
+        so callers can detect unavailability and fall back to other sizing.
+        """
+        if highs.isna().all() or lows.isna().all():
+            return pd.Series(np.nan, index=closes.index)
+
+        prev_close = closes.shift(1)
+        tr = pd.concat(
+            [
+                highs - lows,
+                (highs - prev_close).abs(),
+                (lows  - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+    def _get_latest_indicator_value(
+        self, series: pd.Series, lookback: int = 1
+    ) -> Optional[float]:
+        """
+        Safely return the most recent (or Nth-most-recent) scalar from a Series.
+
+        Parameters
+        ----------
+        series   : pd.Series
+        lookback : 1 = latest, 2 = one bar ago, etc.
+
+        Returns
+        -------
+        float or None if the value is NaN or the series is too short.
+        """
+        if series is None or len(series) < lookback:
+            return None
+        val = series.iloc[-lookback]
+        return None if pd.isna(val) else float(val)
+
+    def _crossed_above(self, fast: pd.Series, slow: pd.Series) -> bool:
+        """
+        True if fast crossed ABOVE slow on the most recent bar (bullish crossover).
+
+        Requires at least 2 rows in both series. Returns False on any NaN.
+        """
+        if len(fast) < 2 or len(slow) < 2:
+            return False
+        fast_now, fast_prev = fast.iloc[-1], fast.iloc[-2]
+        slow_now, slow_prev = slow.iloc[-1], slow.iloc[-2]
+        if any(pd.isna(v) for v in [fast_now, fast_prev, slow_now, slow_prev]):
+            return False
+        return fast_prev <= slow_prev and fast_now > slow_now
+
+    def _crossed_below(self, fast: pd.Series, slow: pd.Series) -> bool:
+        """
+        True if fast crossed BELOW slow on the most recent bar (bearish crossover).
+
+        Requires at least 2 rows in both series. Returns False on any NaN.
+        """
+        if len(fast) < 2 or len(slow) < 2:
+            return False
+        fast_now, fast_prev = fast.iloc[-1], fast.iloc[-2]
+        slow_now, slow_prev = slow.iloc[-1], slow.iloc[-2]
+        if any(pd.isna(v) for v in [fast_now, fast_prev, slow_now, slow_prev]):
+            return False
+        return fast_prev >= slow_prev and fast_now < slow_now
+
+
+# ── Module-level indicator functions (kept for backward compatibility) ──────────
+# These thin wrappers delegate to a throw-away strategy instance so that
+# code importing from engine.strategy as free functions still works.
+
+def _make_indicator_proxy():
+    """Create a minimal concrete subclass just to expose indicator functions."""
+    class _Proxy(BaseStrategy):
+        def calculate_signals(self, event, data_handler):
+            pass
+    proxy = _Proxy.__new__(_Proxy)
+    proxy._config = None
+    proxy._event_queue = None
+    proxy.strategy_id = ""
+    proxy.current_positions = {}
+    return proxy
+
+
+_proxy = _make_indicator_proxy()
+
 
 def sma(series: pd.Series, window: int) -> pd.Series:
-    """
-    Simple Moving Average.
-
-    Parameters
-    ----------
-    series : pd.Series  — price series (typically close).
-    window : int        — look-back period.
-
-    Returns
-    -------
-    pd.Series of the same length; first (window-1) values are NaN.
-    """
-    return series.rolling(window=window, min_periods=window).mean()
+    return _proxy._calculate_sma(series, window)
 
 
 def ema(series: pd.Series, window: int) -> pd.Series:
-    """
-    Exponential Moving Average using pandas' EWM (span=window).
-
-    min_periods=window ensures the first value appears only after
-    `window` data points are available (consistent with SMA behaviour).
-
-    Parameters
-    ----------
-    series : pd.Series
-    window : int
-
-    Returns
-    -------
-    pd.Series
-    """
-    return series.ewm(span=window, min_periods=window, adjust=False).mean()
+    return _proxy._calculate_ema(series, window)
 
 
 def moving_average(series: pd.Series, window: int, ma_type: str = "SMA") -> pd.Series:
-    """
-    Dispatch to sma() or ema() based on ma_type string.
-
-    Parameters
-    ----------
-    series  : pd.Series
-    window  : int
-    ma_type : str — "SMA" or "EMA" (case-insensitive).
-
-    Returns
-    -------
-    pd.Series
-
-    Raises
-    ------
-    ValueError if ma_type is not recognised.
-    """
     t = ma_type.upper()
     if t == "SMA":
         return sma(series, window)
     elif t == "EMA":
         return ema(series, window)
-    else:
-        raise ValueError(f"Unknown ma_type '{ma_type}'. Use 'SMA' or 'EMA'.")
+    raise ValueError(f"Unknown ma_type '{ma_type}'. Use 'SMA' or 'EMA'.")
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Relative Strength Index (Wilder's smoothing method).
-
-    RSI = 100 - (100 / (1 + RS))
-    RS  = avg_gain / avg_loss  (over `period` bars)
-
-    Uses exponential Wilder smoothing (equivalent to EMA with alpha=1/period).
-
-    Parameters
-    ----------
-    series : pd.Series — typically close prices.
-    period : int       — look-back window (standard: 14).
-
-    Returns
-    -------
-    pd.Series — values in [0, 100]; first (period) values are NaN.
-    """
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-
-    # Wilder smoothing: alpha = 1 / period
-    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-
-    rs  = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_val = 100.0 - (100.0 / (1.0 + rs))
-    return rsi_val
+    return _proxy._calculate_rsi(series, period)
 
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Average True Range (Wilder smoothing).
-
-    True Range = max(H-L, |H-Prev_C|, |L-Prev_C|)
-    ATR = EWM mean of TR with alpha = 1/period.
-
-    Parameters
-    ----------
-    high, low, close : pd.Series — aligned OHLC columns.
-    period : int                  — look-back (standard: 14).
-
-    Returns
-    -------
-    pd.Series — ATR values; first (period) values are NaN.
-    """
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low  - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+def atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    return _proxy._calculate_atr(high, low, close, period)
 
 
 def bollinger_bands(
     series: pd.Series, window: int = 20, num_std: float = 2.0
 ) -> pd.DataFrame:
-    """
-    Bollinger Bands.
-
-    Returns a DataFrame with columns: ['upper', 'middle', 'lower'].
-
-    Parameters
-    ----------
-    series  : pd.Series — price series.
-    window  : int       — rolling window for mean and std.
-    num_std : float     — number of standard deviations for the bands.
-    """
     middle = sma(series, window)
     std    = series.rolling(window=window, min_periods=window).std()
-    upper  = middle + num_std * std
-    lower  = middle - num_std * std
-    return pd.DataFrame({"upper": upper, "middle": middle, "lower": lower})
+    return pd.DataFrame({
+        "upper":  middle + num_std * std,
+        "middle": middle,
+        "lower":  middle - num_std * std,
+    })
 
 
 def macd(
-    series: pd.Series,
-    fast: int = 12,
-    slow: int = 26,
-    signal: int = 9,
+    series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
 ) -> pd.DataFrame:
-    """
-    MACD (Moving Average Convergence Divergence).
-
-    Returns a DataFrame with columns: ['macd', 'signal', 'hist'].
-    """
     fast_ema   = ema(series, fast)
     slow_ema   = ema(series, slow)
     macd_line  = fast_ema - slow_ema
     signal_line = ema(macd_line, signal)
-    hist       = macd_line - signal_line
-    return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": hist})
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ABSTRACT STRATEGY BASE
-# ══════════════════════════════════════════════════════════════════════════════
-
-class Strategy(ABC):
-    """
-    Abstract base class for all trading strategies.
-
-    Concrete strategies must implement:
-      - calculate_signals(event: MarketEvent) → None
-        Called once per MarketEvent. Emits zero or more SignalEvents
-        into the shared event_queue.
-
-    Provided helpers:
-      - _get_bars(symbol, N)     → pd.DataFrame or None
-      - _emit_signal(event, direction, strength)
-      - _is_invested(symbol)     → bool
-      - _current_price(symbol)   → float or None
-    """
-
-    def __init__(
-        self,
-        config: BacktestConfig,
-        data_handler: DataHandler,
-        event_queue: deque,
-    ) -> None:
-        self._config       = config
-        self._data         = data_handler
-        self._event_queue  = event_queue
-        # Subclasses can store per-symbol state in _state dict
-        self._state: dict  = {}
-
-    # ── Abstract interface ────────────────────────────────────────────────
-
-    @property
-    @abstractmethod
-    def strategy_id(self) -> str:
-        """Unique human-readable identifier for this strategy instance."""
-        ...
-
-    @abstractmethod
-    def calculate_signals(self, event: MarketEvent) -> None:
-        """
-        Core signal generation logic.
-
-        Called by the event loop on every MarketEvent.
-        Must call self._emit_signal(...) to place signals in the queue.
-
-        Parameters
-        ----------
-        event : MarketEvent — the most recent bar just pushed by DataHandler.
-        """
-        ...
-
-    # ── Protected helpers ─────────────────────────────────────────────────
-
-    def _get_bars(self, symbol: str, N: int) -> Optional[pd.DataFrame]:
-        """
-        Return the last N bars for symbol from DataHandler.
-        Returns None if symbol is unknown or insufficient history exists.
-        """
-        bars = self._data.get_latest_bars(symbol, N)
-        if bars is None or len(bars) < N:
-            return None
-        return bars
-
-    def _emit_signal(
-        self,
-        event: MarketEvent,
-        direction: SignalDirection,
-        strength: float = 1.0,
-    ) -> None:
-        """
-        Construct a SignalEvent and push it into the event queue.
-
-        Parameters
-        ----------
-        event     : MarketEvent — the triggering bar event.
-        direction : SignalDirection
-        strength  : float ∈ [0, 1] — confidence (default 1.0).
-        """
-        signal = SignalEvent(
-            timestamp=event.timestamp,
-            symbol=event.symbol,
-            strategy_id=self.strategy_id,
-            direction=direction,
-            strength=max(0.0, min(1.0, strength)),
-        )
-        self._event_queue.append(signal)
-        logger.debug(
-            "[%s] %s signal on %s @ %s (strength=%.2f)",
-            self.strategy_id,
-            direction.value,
-            event.symbol,
-            event.timestamp.date() if event.timestamp else "N/A",
-            strength,
-        )
-
-    def _is_invested(self, symbol: str) -> bool:
-        """
-        Check whether the portfolio currently holds a position in `symbol`.
-
-        The Portfolio object is not directly accessible here to keep coupling
-        loose. Instead, the strategy tracks its own notion of "invested" via
-        a state dict. The Portfolio sends back a FillEvent which the strategy
-        can observe — but for simplicity, strategies track signal state only.
-
-        Subclasses update self._state[symbol]["invested"] on entry/exit signals.
-        """
-        return self._state.get(symbol, {}).get("invested", False)
-
-    def _set_invested(self, symbol: str, invested: bool) -> None:
-        """Update the invested flag for a symbol."""
-        if symbol not in self._state:
-            self._state[symbol] = {}
-        self._state[symbol]["invested"] = invested
-
-    def _current_price(self, symbol: str) -> Optional[float]:
-        """Return the close price of the current bar for a symbol."""
-        return self._data.get_current_price(symbol)
+    return pd.DataFrame({
+        "macd":   macd_line,
+        "signal": signal_line,
+        "hist":   macd_line - signal_line,
+    })

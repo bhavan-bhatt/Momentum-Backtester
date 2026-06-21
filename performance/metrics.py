@@ -389,3 +389,54 @@ def compute_all_metrics(
                         "information_ratio": np.nan, "benchmark_return": np.nan})
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERFORMANCE METRICS CLASS — object-oriented wrapper around compute_all_metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PerformanceMetrics:
+    """
+    Object-oriented wrapper used by BacktestEngine._finalise().
+
+    Usage
+    -----
+    perf    = PerformanceMetrics(config)
+    metrics = perf.generate_summary_report(equity_curve, trade_log, benchmark_curve)
+    """
+
+    def __init__(self, config) -> None:
+        """
+        Parameters
+        ----------
+        config : BacktestConfig
+        """
+        self._config = config
+
+    def generate_summary_report(
+        self,
+        equity_curve: pd.Series,
+        trade_log: pd.DataFrame,
+        benchmark_curve: Optional[pd.Series] = None,
+    ) -> Dict[str, float]:
+        """
+        Compute the full suite of performance metrics.
+
+        Parameters
+        ----------
+        equity_curve    : pd.Series indexed by date — portfolio equity.
+        trade_log       : pd.DataFrame from PortfolioManager.get_trade_log().
+        benchmark_curve : pd.Series or None — benchmark equity (same scale).
+
+        Returns
+        -------
+        Dict[str, float] — all metrics keyed by name.
+        """
+        rcfg = self._config.report
+        return compute_all_metrics(
+            equity=equity_curve,
+            trade_log=trade_log if trade_log is not None else pd.DataFrame(),
+            benchmark_equity=benchmark_curve,
+            risk_free_rate=rcfg.risk_free_rate,
+            trading_days=rcfg.trading_days_per_year,
+        )

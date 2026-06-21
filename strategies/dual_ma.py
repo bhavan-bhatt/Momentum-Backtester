@@ -1,105 +1,99 @@
 # strategies/dual_ma.py
 # ============================================================
 # DUAL MOVING AVERAGE CROSSOVER STRATEGY
-#
-# Logic
-# -----
-# LONG  signal: fast MA crosses ABOVE slow MA (golden cross).
-# EXIT  signal: fast MA crosses BELOW slow MA (death cross).
-#
-# The strategy tracks the previous bar's MA relationship to detect
-# only the bar on which the crossover occurs, avoiding repeated signals.
+# Signals LONG when fast MA crosses above slow MA (golden cross).
+# Signals EXIT_LONG when fast MA crosses below slow MA (death cross).
 # ============================================================
 
 import logging
 from collections import deque
 
-import numpy as np
-
 from engine.events import MarketEvent, SignalDirection
-from engine.strategy import Strategy, moving_average
-from engine.data_handler import DataHandler
+from engine.strategy import BaseStrategy
 from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
 
 
-class DualMAStrategy(Strategy):
+class DualMAStrategy(BaseStrategy):
     """
     Dual Moving Average Crossover strategy.
 
-    Configurable parameters (from StrategyConfig):
-      fast_ma_window  — short MA period.
-      slow_ma_window  — long MA period.
-      ma_type         — "SMA" or "EMA".
-      allow_short     — if True, emits SHORT on death cross.
+    Logic
+    -----
+    LONG entry    : fast MA crosses ABOVE slow MA (golden cross) while flat.
+    EXIT_LONG     : fast MA crosses BELOW slow MA (death cross) while long.
+    SHORT entry   : fast MA crosses BELOW slow MA while flat (if allow_short=True).
+    EXIT_SHORT    : fast MA crosses ABOVE slow MA while short (if allow_short=True).
 
-    State per symbol (stored in self._state[symbol]):
-      prev_fast, prev_slow — MA values from the previous bar.
-      invested             — whether we hold a position.
+    Only one signal is emitted per symbol per bar. EXIT is always checked before ENTRY
+    so an exit on the same bar as a new cross is not double-counted.
+
+    Parameters (from StrategyConfig)
+    ----------------------------------
+    fast_ma_window : int  — fast period (default 20).
+    slow_ma_window : int  — slow period (default 50). Must be > fast.
+    ma_type        : str  — "SMA" or "EMA".
+    allow_short    : bool — enable SHORT signals.
     """
 
-    def __init__(
-        self,
-        config: BacktestConfig,
-        data_handler: DataHandler,
-        event_queue: deque,
-    ) -> None:
-        super().__init__(config, data_handler, event_queue)
-        scfg = config.strategy
-        self._fast = scfg.fast_ma_window
-        self._slow = scfg.slow_ma_window
-        self._ma_type = scfg.ma_type
+    def __init__(self, config: BacktestConfig, event_queue: deque) -> None:
+        super().__init__(config, event_queue)
 
-        if self._fast >= self._slow:
+        scfg = config.strategy
+        self.fast_window  = scfg.fast_ma_window
+        self.slow_window  = scfg.slow_ma_window
+        self.ma_type      = scfg.ma_type
+        self.allow_short  = scfg.allow_short
+
+        if self.fast_window >= self.slow_window:
             raise ValueError(
-                f"DualMA: fast_ma_window ({self._fast}) must be < "
-                f"slow_ma_window ({self._slow})."
+                f"DualMAStrategy: fast_ma_window ({self.fast_window}) must be "
+                f"< slow_ma_window ({self.slow_window})."
             )
 
-        # Lookback needed: slow_window + 1 (for previous bar comparison)
-        self._lookback = self._slow + 1
+        self.strategy_id  = f"DualMA_{self.ma_type}_{self.fast_window}_{self.slow_window}"
+        # +2: need current bar AND previous bar for crossover detection
+        self.required_bars = self.slow_window + 2
 
-    @property
-    def strategy_id(self) -> str:
-        return f"DualMA_{self._ma_type}_{self._fast}_{self._slow}"
+    def calculate_signals(self, event: MarketEvent, data_handler) -> None:
+        """
+        Compute MAs and emit a signal if a crossover occurred on this bar.
 
-    def calculate_signals(self, event: MarketEvent) -> None:
+        Parameters
+        ----------
+        event        : MarketEvent for one symbol.
+        data_handler : DataHandler to fetch historical bars.
+        """
+        bars = data_handler.get_latest_bars(event.symbol, self.required_bars)
+        if not self._has_enough_bars(bars, self.required_bars):
+            return
+
+        prices = bars["close"]
+
+        if self.ma_type == "SMA":
+            fast_ma = self._calculate_sma(prices, self.fast_window)
+            slow_ma = self._calculate_sma(prices, self.slow_window)
+        else:
+            fast_ma = self._calculate_ema(prices, self.fast_window)
+            slow_ma = self._calculate_ema(prices, self.slow_window)
+
         symbol = event.symbol
-        bars   = self._get_bars(symbol, self._lookback)
-        if bars is None:
+
+        # ── EXIT checks first (always before entry) ───────────────────────
+        if self._is_long(symbol) and self._crossed_below(fast_ma, slow_ma):
+            self._emit_signal(symbol, event.timestamp, SignalDirection.EXIT_LONG)
             return
 
-        close  = bars["close"]
-        fast_s = moving_average(close, self._fast, self._ma_type)
-        slow_s = moving_average(close, self._slow, self._ma_type)
-
-        if len(fast_s) < 2 or len(slow_s) < 2:
+        if self._is_short(symbol) and self._crossed_above(fast_ma, slow_ma):
+            self._emit_signal(symbol, event.timestamp, SignalDirection.EXIT_SHORT)
             return
 
-        fast_now  = fast_s.iloc[-1]
-        slow_now  = slow_s.iloc[-1]
-        fast_prev = fast_s.iloc[-2]
-        slow_prev = slow_s.iloc[-2]
+        # ── ENTRY checks ─────────────────────────────────────────────────
+        if self._is_flat(symbol):
+            if self._crossed_above(fast_ma, slow_ma):
+                self._emit_signal(symbol, event.timestamp, SignalDirection.LONG)
+                return
 
-        # Guard against NaN values (insufficient history)
-        if any(np.isnan(v) for v in [fast_now, slow_now, fast_prev, slow_prev]):
-            return
-
-        invested = self._is_invested(symbol)
-
-        # ── Golden cross: fast crosses above slow ────────────────────────
-        if fast_prev <= slow_prev and fast_now > slow_now:
-            if not invested:
-                self._emit_signal(event, SignalDirection.LONG)
-                self._set_invested(symbol, True)
-
-        # ── Death cross: fast crosses below slow ─────────────────────────
-        elif fast_prev >= slow_prev and fast_now < slow_now:
-            if invested:
-                self._emit_signal(event, SignalDirection.EXIT_LONG)
-                self._set_invested(symbol, False)
-
-            if self._config.strategy.allow_short and not invested:
-                self._emit_signal(event, SignalDirection.SHORT)
-                self._set_invested(symbol, True)
+            if self.allow_short and self._crossed_below(fast_ma, slow_ma):
+                self._emit_signal(symbol, event.timestamp, SignalDirection.SHORT)

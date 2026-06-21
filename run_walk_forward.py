@@ -13,6 +13,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
@@ -36,11 +37,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy", choices=["dual_ma", "rsi", "combined"], default="combined",
     )
-    parser.add_argument("--train", type=int, default=None, help="Train window in years.")
-    parser.add_argument("--test",  type=int, default=None, help="Test window in years.")
-    parser.add_argument("--step",  type=int, default=None, help="Step size in years.")
-    parser.add_argument("--metric", default="sharpe_ratio",
-                        help="Metric to chart across splits.")
+    parser.add_argument("--train",  type=int, default=None, help="Train window in years.")
+    parser.add_argument("--test",   type=int, default=None, help="Test window in years.")
+    parser.add_argument("--step",   type=int, default=None, help="Step size in years.")
+    parser.add_argument("--metric", default="sharpe_ratio",  help="Metric to chart across splits.")
     return parser.parse_args()
 
 
@@ -50,13 +50,9 @@ def main() -> None:
 
     from config import CONFIG
 
-    if args.train:
-        CONFIG.walk_forward.train_years = args.train
-    if args.test:
-        CONFIG.walk_forward.test_years = args.test
-    if args.step:
-        CONFIG.walk_forward.step_years = args.step
-
+    if args.train: CONFIG.walk_forward.train_years = args.train
+    if args.test:  CONFIG.walk_forward.test_years  = args.test
+    if args.step:  CONFIG.walk_forward.step_years  = args.step
     CONFIG.verbose = True
 
     if args.strategy == "dual_ma":
@@ -84,23 +80,17 @@ def main() -> None:
 
     # Save summary CSV
     os.makedirs("output", exist_ok=True)
-    safe_id = StrategyClass.__name__
-    from datetime import datetime
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"output/walk_forward_{safe_id}_{ts}.csv"
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = f"output/walk_forward_{StrategyClass.__name__}_{ts}.csv"
     summary.to_csv(csv_path, index=False)
     print(f"[WalkForward] Summary saved → {csv_path}")
 
-    # Chart across splits
+    # Chart
     try:
         from reports.charts import walk_forward_summary_chart
-        chart_path = f"output/charts/wf_{safe_id}_{args.metric}_{ts}.png"
         os.makedirs("output/charts", exist_ok=True)
-        walk_forward_summary_chart(
-            summary,
-            metric=args.metric,
-            save_path=chart_path,
-        )
+        chart_path = f"output/charts/wf_{StrategyClass.__name__}_{args.metric}_{ts}.png"
+        walk_forward_summary_chart(summary, metric=args.metric, save_path=chart_path)
         print(f"[WalkForward] Chart saved → {chart_path}")
     except Exception as e:
         print(f"[WalkForward] Chart skipped: {e}")

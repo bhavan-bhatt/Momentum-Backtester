@@ -6,6 +6,7 @@
 
 import logging
 from collections import deque
+from typing import Optional
 
 from engine.events import OrderEvent, OrderDirection, FillEvent
 from engine.data_handler import DataHandler
@@ -20,38 +21,41 @@ class ExecutionHandler:
 
     Execution Model
     ---------------
-    - Orders are filled at the NEXT bar's open price (fill_at="next_open").
-    - Slippage is applied symmetrically: BUY fills higher, SELL fills lower.
-    - Transaction costs:
-        BUY  side: commission + exchange charges + stamp duty
-        SELL side: commission + exchange charges + STT
+    - Orders fill at the NEXT bar's open price (fill_at="next_open").
+    - Slippage is directional: BUY fills higher, SELL fills lower.
+    - All NSE delivery-segment costs are modelled explicitly.
 
-    Cost Breakdown (per NSE delivery segment)
-    ------------------------------------------
-    commission        : 0.03% of trade value (both sides)
-    exchange charges  : 0.00345% of trade value (both sides)
-    stamp_duty        : 0.015% of trade value (BUY side only)
-    STT               : 0.1% of trade value (SELL side only)
+    Cost Breakdown
+    --------------
+    commission       : 0.03%  — both sides
+    exchange charges : 0.00345% — both sides
+    stamp_duty       : 0.015% — BUY side only
+    STT              : 0.1%   — SELL side only
     """
 
     def __init__(
         self,
         config: BacktestConfig,
         data_handler: DataHandler,
-        event_queue: deque,
+        event_queue: Optional[deque] = None,
     ) -> None:
         self._config      = config
         self._data        = data_handler
-        self._event_queue = event_queue
+        self._event_queue = event_queue  # may be injected later by BacktestEngine
 
-    def on_order(self, order: OrderEvent) -> None:
+    def execute_order(self, order: OrderEvent, data_handler: DataHandler) -> None:
         """
         Process an OrderEvent and emit a FillEvent.
 
+        Parameters
+        ----------
+        order        : OrderEvent from PortfolioManager.
+        data_handler : DataHandler — used to get fill price (next-open or current-close).
+
         Steps
         -----
-        1. Determine the fill price (next-open + slippage).
-        2. Compute transaction costs.
+        1. Determine fill price (next-open + slippage).
+        2. Compute all transaction costs.
         3. Build and queue a FillEvent.
         """
         symbol    = order.symbol
@@ -63,12 +67,12 @@ class ExecutionHandler:
             logger.warning("Order for %s has quantity %d — skipped.", symbol, quantity)
             return
 
-        # ── Fill price ───────────────────────────────────────────────────
+        # ── Fill price ────────────────────────────────────────────────────
         if ecfg.fill_at == "next_open":
-            base_price = self._data.get_next_open(symbol)
+            base_price = data_handler.get_next_open(symbol)
         else:
-            # "same_close" — unrealistic but supported for debugging
-            base_price = self._data.get_current_price(symbol)
+            # "same_close" — unrealistic but useful for debugging
+            base_price = data_handler.get_current_price(symbol)
 
         if base_price is None or base_price <= 0:
             logger.warning(
@@ -76,7 +80,7 @@ class ExecutionHandler:
             )
             return
 
-        # Slippage: BUY pays more, SELL receives less
+        # Slippage
         if direction == OrderDirection.BUY:
             fill_price = base_price * (1.0 + ecfg.slippage_pct)
         else:
@@ -84,22 +88,20 @@ class ExecutionHandler:
 
         slippage_cost = abs(fill_price - base_price) * quantity
 
-        # ── Transaction costs ────────────────────────────────────────────
+        # ── Transaction costs ─────────────────────────────────────────────
         trade_value = fill_price * quantity
         commission  = trade_value * ecfg.commission_pct
         exchange    = trade_value * ecfg.exchange_charges_pct
 
         if direction == OrderDirection.BUY:
-            stamp_duty  = trade_value * ecfg.stamp_duty_pct
-            total_cost  = commission + exchange + stamp_duty
+            stamp_duty = trade_value * ecfg.stamp_duty_pct
+            total_cost = commission + exchange + stamp_duty
         else:
-            stt         = trade_value * ecfg.stt_pct
-            total_cost  = commission + exchange + stt
+            stt        = trade_value * ecfg.stt_pct
+            total_cost = commission + exchange + stt
 
-        # ── Determine fill timestamp ─────────────────────────────────────
-        # If filling at next open, the timestamp advances by one bar.
-        # We use the current datetime from DataHandler (already incremented).
-        fill_ts = self._data.get_current_datetime()
+        # ── Fill timestamp ────────────────────────────────────────────────
+        fill_ts = data_handler.get_current_datetime()
         if fill_ts is None:
             fill_ts = order.timestamp
 
@@ -120,3 +122,8 @@ class ExecutionHandler:
             direction.value, symbol, quantity,
             fill_price, slippage_cost, total_cost,
         )
+
+    # ── Backward-compatibility alias ──────────────────────────────────────
+    def on_order(self, order: OrderEvent) -> None:
+        """Deprecated alias — use execute_order(order, data_handler) instead."""
+        self.execute_order(order, self._data)

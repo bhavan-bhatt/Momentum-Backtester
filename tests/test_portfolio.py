@@ -42,6 +42,8 @@ def _make_portfolio(
     return port, queue, handler, cfg
 
 
+
+
 def _signal(symbol: str = "SYM", direction: SignalDirection = SignalDirection.LONG) -> SignalEvent:
     return SignalEvent(
         timestamp=datetime(2020, 3, 1),
@@ -92,7 +94,7 @@ class TestPortfolioEquity:
         port, queue, handler, _ = _make_portfolio()
         # Simulate a BUY fill
         f = _fill(qty=100, price=1000.0)
-        port.on_fill(f)
+        port.update_portfolio_on_fill(f)
         handler.get_current_price.return_value = 1100.0  # price up 10%
         # equity = cash + 100 * 1100
         expected = port.cash + 100 * 1100.0
@@ -103,7 +105,7 @@ class TestOnSignal:
     def test_long_signal_emits_order(self):
         port, queue, handler, _ = _make_portfolio()
         handler.get_current_price.return_value = 1000.0
-        port.on_signal(_signal(direction=SignalDirection.LONG))
+        port.process_signal(_signal(direction=SignalDirection.LONG), handler)
         orders = [e for e in queue if e.event_type == EventType.ORDER]
         assert len(orders) == 1
         assert orders[0].direction == OrderDirection.BUY
@@ -111,14 +113,14 @@ class TestOnSignal:
     def test_duplicate_long_ignored(self):
         port, queue, handler, _ = _make_portfolio()
         # First signal → enters
-        port.on_signal(_signal(direction=SignalDirection.LONG))
+        port.process_signal(_signal(direction=SignalDirection.LONG), handler)
         # Fill it
         order = queue.popleft()
         fill  = _fill(qty=order.quantity, price=1000.0, order=order)
-        port.on_fill(fill)
+        port.update_portfolio_on_fill(fill)
         queue.clear()
         # Second signal → should be ignored (already invested)
-        port.on_signal(_signal(direction=SignalDirection.LONG))
+        port.process_signal(_signal(direction=SignalDirection.LONG), handler)
         assert len(queue) == 0
 
     def test_max_positions_respected(self):
@@ -126,13 +128,13 @@ class TestOnSignal:
         handler.get_current_price.return_value = 1000.0
 
         # First signal → accepted
-        port.on_signal(_signal("SYM", SignalDirection.LONG))
+        port.process_signal(_signal("SYM", SignalDirection.LONG), handler)
         order1 = queue.popleft()
-        port.on_fill(_fill("SYM", qty=order1.quantity, order=order1))
+        port.update_portfolio_on_fill(_fill("SYM", qty=order1.quantity, order=order1))
         queue.clear()
 
         # Second signal on different symbol → rejected (max positions = 1)
-        port.on_signal(_signal("SYM2", SignalDirection.LONG))
+        port.process_signal(_signal("SYM2", SignalDirection.LONG), handler)
         orders = [e for e in queue if e.event_type == EventType.ORDER]
         assert len(orders) == 0
 
@@ -140,26 +142,26 @@ class TestOnSignal:
         port, queue, handler, _ = _make_portfolio()
 
         # Enter first
-        port.on_signal(_signal(direction=SignalDirection.LONG))
+        port.process_signal(_signal(direction=SignalDirection.LONG), handler)
         order = queue.popleft()
-        port.on_fill(_fill(qty=order.quantity, order=order))
+        port.update_portfolio_on_fill(_fill(qty=order.quantity, order=order))
         queue.clear()
 
         # Exit
-        port.on_signal(_signal(direction=SignalDirection.EXIT_LONG))
+        port.process_signal(_signal(direction=SignalDirection.EXIT_LONG), handler)
         orders = [e for e in queue if e.event_type == EventType.ORDER]
         assert len(orders) == 1
         assert orders[0].direction == OrderDirection.SELL
 
     def test_short_ignored_when_allow_short_false(self):
         port, queue, handler, _ = _make_portfolio(allow_short=False)
-        port.on_signal(_signal(direction=SignalDirection.SHORT))
+        port.process_signal(_signal(direction=SignalDirection.SHORT), handler)
         orders = [e for e in queue if e.event_type == EventType.ORDER]
         assert len(orders) == 0
 
     def test_exit_without_position_does_nothing(self):
-        port, queue, _, _ = _make_portfolio()
-        port.on_signal(_signal(direction=SignalDirection.EXIT_LONG))
+        port, queue, handler, _ = _make_portfolio()
+        port.process_signal(_signal(direction=SignalDirection.EXIT_LONG), handler)
         assert len(queue) == 0
 
 
@@ -168,7 +170,7 @@ class TestOnFill:
         port, queue, _, _ = _make_portfolio()
         initial_cash = port.cash
         f = _fill(qty=100, price=1000.0)
-        port.on_fill(f)
+        port.update_portfolio_on_fill(f)
         # cost = 100 * 1000 + 50 (commission)
         expected_cash = initial_cash - (100 * 1000.0 + 50.0)
         assert port.cash == pytest.approx(expected_cash)
@@ -176,7 +178,7 @@ class TestOnFill:
     def test_buy_creates_position(self):
         port, queue, _, _ = _make_portfolio()
         f = _fill(qty=50, price=2000.0)
-        port.on_fill(f)
+        port.update_portfolio_on_fill(f)
         assert "SYM" in port.open_positions
         assert port.open_positions["SYM"].quantity == 50
 
@@ -184,12 +186,12 @@ class TestOnFill:
         port, queue, handler, _ = _make_portfolio()
         # First buy
         f_buy = _fill(direction=OrderDirection.BUY, qty=100, price=1000.0)
-        port.on_fill(f_buy)
+        port.update_portfolio_on_fill(f_buy)
         cash_after_buy = port.cash
 
         # Then sell
         f_sell = _fill(direction=OrderDirection.SELL, qty=100, price=1100.0)
-        port.on_fill(f_sell)
+        port.update_portfolio_on_fill(f_sell)
         # proceeds = 100 * 1100 - 50 commission
         expected_cash = cash_after_buy + (100 * 1100.0 - 50.0)
         assert port.cash == pytest.approx(expected_cash)
@@ -197,15 +199,15 @@ class TestOnFill:
     def test_sell_removes_position(self):
         port, queue, _, _ = _make_portfolio()
         f_buy  = _fill(qty=100, price=1000.0)
-        port.on_fill(f_buy)
+        port.update_portfolio_on_fill(f_buy)
         f_sell = _fill(direction=OrderDirection.SELL, qty=100, price=1050.0)
-        port.on_fill(f_sell)
+        port.update_portfolio_on_fill(f_sell)
         assert "SYM" not in port.open_positions
 
     def test_partial_sell_leaves_remaining(self):
         port, queue, _, _ = _make_portfolio()
-        port.on_fill(_fill(qty=100, price=1000.0))
-        port.on_fill(_fill(direction=OrderDirection.SELL, qty=40, price=1050.0))
+        port.update_portfolio_on_fill(_fill(qty=100, price=1000.0))
+        port.update_portfolio_on_fill(_fill(direction=OrderDirection.SELL, qty=40, price=1050.0))
         assert port.open_positions["SYM"].quantity == 60
 
 
@@ -222,16 +224,16 @@ class TestEquityCurveAndTradelog:
         port, queue, handler, _ = _make_portfolio()
         f_buy  = _fill(qty=100, price=1000.0)
         f_sell = _fill(direction=OrderDirection.SELL, qty=100, price=1100.0)
-        port.on_fill(f_buy)
-        port.on_fill(f_sell)
+        port.update_portfolio_on_fill(f_buy)
+        port.update_portfolio_on_fill(f_sell)
         tlog = port.get_trade_log()
         assert "ENTRY" in tlog["type"].values
         assert "EXIT"  in tlog["type"].values
 
     def test_realised_pnl_correct(self):
         port, _, _, _ = _make_portfolio()
-        port.on_fill(_fill(qty=100, price=1000.0))
-        port.on_fill(_fill(direction=OrderDirection.SELL, qty=100, price=1100.0))
+        port.update_portfolio_on_fill(_fill(qty=100, price=1000.0))
+        port.update_portfolio_on_fill(_fill(direction=OrderDirection.SELL, qty=100, price=1100.0))
         tlog   = port.get_trade_log()
         exit_r = tlog[tlog["type"] == "EXIT"]["realised_pnl"].values[0]
         # pnl = 100 * (1100 - 1000) - 50 commission

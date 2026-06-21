@@ -25,8 +25,8 @@ from typing import Dict, List, Optional, Tuple, Type
 import pandas as pd
 
 from engine.data_handler import DataHandler
-from engine.backtest import Backtest
-from engine.strategy import Strategy
+from engine.backtest import build_backtest_engine
+from engine.strategy import BaseStrategy
 from performance.metrics import compute_all_metrics
 from config import BacktestConfig
 
@@ -65,12 +65,12 @@ class WalkForwardEngine:
     strategy_cls  : Type[Strategy] — strategy class to instantiate per split.
     """
 
-    def __init__(self, config: BacktestConfig, strategy_cls: Type[Strategy]) -> None:
+    def __init__(self, config: BacktestConfig, strategy_cls: Type[BaseStrategy]) -> None:
         self._config       = config
         self._strategy_cls = strategy_cls
         self._splits:  List[WalkForwardSplit] = []
 
-    def generate_splits(self, all_dates: List[datetime]) -> List[WalkForwardSplit]:
+    def generate_splits(self, all_dates: List[datetime]) -> List["WalkForwardSplit"]:
         """
         Produce train/test split metadata from a sorted list of trading dates.
 
@@ -139,10 +139,10 @@ class WalkForwardEngine:
         -------
         List[WalkForwardSplit] with metrics populated.
         """
-        # Use a temporary Backtest to access the aligned dates
-        temp_bt = Backtest(self._config, self._strategy_cls)
-        all_dates = temp_bt.data_handler._all_dates
-        del temp_bt
+        # Build a temporary engine just to access aligned dates
+        temp_engine = build_backtest_engine(self._config, self._strategy_cls)
+        all_dates   = temp_engine.data_handler._all_dates
+        del temp_engine
 
         splits = self.generate_splits(all_dates)
         if not splits:
@@ -164,11 +164,11 @@ class WalkForwardEngine:
             test_cfg = self._make_test_config(split)
 
             try:
-                bt = Backtest(test_cfg, self._strategy_cls)
-                bt.run()
+                bt      = build_backtest_engine(test_cfg, self._strategy_cls)
+                results = bt.run()
 
-                equity     = bt.get_equity_curve()["equity"] if not bt.get_equity_curve().empty else pd.Series()
-                trade_log  = bt.get_trade_log()
+                equity    = results["equity_curve"]
+                trade_log = results["trade_log"]
 
                 bench_equity = None
                 if bt.data_handler.benchmark_data is not None:
@@ -177,7 +177,7 @@ class WalkForwardEngine:
 
                 metrics = compute_all_metrics(
                     equity,
-                    trade_log,
+                    trade_log if trade_log is not None else pd.DataFrame(),
                     benchmark_equity=bench_equity,
                     risk_free_rate=rcfg.risk_free_rate,
                     trading_days=rcfg.trading_days_per_year,
