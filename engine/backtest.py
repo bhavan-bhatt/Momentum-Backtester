@@ -27,25 +27,17 @@ class BacktestEngine:
 
     Event flow per bar
     ------------------
-    DataHandler.update_bars()          → N × MarketEvent (one per symbol)
+    DataHandler.update_bars()         → N × MarketEvent (one per symbol)
       MarketEvent  → strategy.calculate_signals(event, data_handler)
-                       → may produce SignalEvent(s)
       SignalEvent  → portfolio.process_signal(event, data_handler)
-                       → may produce OrderEvent(s)
       OrderEvent   → execution.execute_order(event, data_handler)
-                       → produces FillEvent(s)
       FillEvent    → portfolio.update_portfolio_on_fill(event)
-    End of bar: portfolio.update_equity_curve(timestamp)
+    End of bar: portfolio.record_equity(timestamp, data_handler)
 
     Constructor
     -----------
-    Receives pre-built component instances. Creates its own event queue and
-    injects it into every component so they all share the same deque.
-
-    Usage
-    -----
-    engine = BacktestEngine(config, data_handler, strategy, portfolio, execution)
-    results = engine.run()
+    Receives pre-built component instances. Creates its own event queue
+    and injects it into every component.
     """
 
     def __init__(
@@ -62,7 +54,7 @@ class BacktestEngine:
         self.portfolio    = portfolio
         self.execution    = execution
 
-        # Shared event queue — injected into all components
+        # Single shared queue — injected into all components
         self.event_queue: deque = deque()
         data_handler._event_queue  = self.event_queue
         portfolio._event_queue     = self.event_queue
@@ -84,11 +76,11 @@ class BacktestEngine:
         Returns
         -------
         dict with keys:
-          "equity_curve"   → pd.Series (date → portfolio value)
-          "trade_log"      → pd.DataFrame of closed trades
-          "metrics"        → dict of performance metrics
-          "open_positions" → dict of positions still open at end
-          "benchmark_curve"→ pd.Series (normalised benchmark), or None
+          "equity_curve"    → pd.Series (date → portfolio value)
+          "trade_log"       → List[dict] of closed trades
+          "metrics"         → dict of performance metrics
+          "open_positions"  → dict of positions still open at end
+          "benchmark_curve" → pd.Series (normalised benchmark), or None
         """
         symbols    = self.data_handler.get_symbols()
         start_date = self._config.data.start_date
@@ -112,7 +104,6 @@ class BacktestEngine:
         while self.data_handler.has_more_bars():
             self.data_handler.update_bars()
 
-            # Drain the event queue completely for this bar
             while self.event_queue:
                 event = self.event_queue.popleft()
                 self._process_event(event)
@@ -120,12 +111,10 @@ class BacktestEngine:
 
             self._iteration_count += 1
 
-            # End-of-bar equity snapshot
             current_dt = self.data_handler.get_current_datetime()
             if current_dt is not None:
-                self.portfolio.update_equity_curve(current_dt)
+                self.portfolio.record_equity(current_dt, self.data_handler)
 
-            # Progress output every ~252 bars (roughly one trading year)
             if (
                 self._config.verbose
                 and self._iteration_count % 252 == 0
@@ -183,27 +172,21 @@ class BacktestEngine:
 
         Steps
         -----
-        1. Close all open positions at the last available price (mark-to-market).
-           This correctly credits unrealised PnL to the final equity.
-        2. Build the equity curve, trade log, and benchmark curve.
+        1. Mark open positions to market (already in record_equity).
+        2. Build equity curve, trade log, and benchmark curve.
         3. Run PerformanceMetrics to generate all metrics.
-        4. Populate self._results.
+        4. Store in self._results.
         """
-        # ── Mark-to-market open positions ─────────────────────────────────
-        # Unrealised PnL is included in portfolio.equity already (via the
-        # equity property). We record a final equity snapshot here.
-        final_equity = self.portfolio.equity
-        final_dt     = self.data_handler.get_current_datetime()
-        if final_dt is not None:
-            # Override the last equity curve entry to include mark-to-market
-            if self.portfolio._equity_curve:
-                self.portfolio._equity_curve[-1]["equity"] = final_equity
+        # Override last equity curve entry with fresh mark-to-market
+        final_equity = self.portfolio.get_total_equity(self.data_handler)
+        if self.portfolio.equity_curve:
+            ts = self.portfolio.equity_curve[-1][0]
+            self.portfolio.equity_curve[-1] = (ts, final_equity)
 
-        # ── Equity curve & trade log ──────────────────────────────────────
         equity_curve = self.portfolio.calculate_equity_curve()
-        trade_log    = self.portfolio.get_trade_log()
+        trade_log    = self.portfolio.get_trade_log()      # List[dict]
 
-        # ── Benchmark curve (normalised to portfolio's start capital) ─────
+        # ── Benchmark curve (normalised to portfolio's starting capital) ──
         benchmark_curve = None
         if self.data_handler.benchmark_data is not None:
             bc = self.data_handler.benchmark_data["close"].copy()
@@ -216,28 +199,27 @@ class BacktestEngine:
         metrics = perf.generate_summary_report(equity_curve, trade_log, benchmark_curve)
 
         if self._config.verbose:
-            _print_metrics(metrics)
+            _print_metrics(metrics, self.strategy.strategy_id)
 
-        # ── Store results ─────────────────────────────────────────────────
         self._results = {
             "equity_curve":    equity_curve,
             "trade_log":       trade_log,
             "metrics":         metrics,
-            "open_positions":  dict(self.portfolio.open_positions),
+            "open_positions":  self.portfolio.get_open_positions(),
             "benchmark_curve": benchmark_curve,
         }
 
-    # ── Convenience accessors (kept for existing code that calls these) ───
+    # ── Convenience accessors ─────────────────────────────────────────────
 
-    def get_equity_curve(self) -> pd.DataFrame:
-        return self.portfolio.get_equity_curve()
+    def get_equity_curve(self) -> pd.Series:
+        return self.portfolio.calculate_equity_curve()
 
-    def get_trade_log(self) -> pd.DataFrame:
+    def get_trade_log(self) -> list:
         return self.portfolio.get_trade_log()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FACTORY — convenience function that builds and wires all components
+# FACTORY — build + wire all components
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_backtest_engine(
@@ -245,38 +227,34 @@ def build_backtest_engine(
     strategy_cls: Type[BaseStrategy],
 ) -> BacktestEngine:
     """
-    Convenience factory: build all components and return a ready BacktestEngine.
-
-    This is the one-liner entry-point used by run_backtest.py.
-    Individual components can also be built manually for more control.
+    Convenience factory: build all components and return a wired BacktestEngine.
     """
-    data_handler = DataHandler(config, None)   # queue injected by BacktestEngine
-    portfolio    = PortfolioManager(config, data_handler, None)
-    execution    = ExecutionHandler(config, data_handler, None)
-    strategy     = strategy_cls(config, None)
-
+    queue        = deque()
+    data_handler = DataHandler(config, queue)
+    strategy     = strategy_cls(config, queue)
+    portfolio    = PortfolioManager(config, queue)
+    execution    = ExecutionHandler(config, queue)
     return BacktestEngine(config, data_handler, strategy, portfolio, execution)
 
 
-def _print_metrics(metrics: dict) -> None:
-    """Print a compact metrics summary to stdout."""
-    FMT = {
-        "total_return":          ("Total Return",       "{:.2%}"),
-        "cagr":                  ("CAGR",               "{:.2%}"),
-        "annualised_volatility": ("Annual Volatility",  "{:.2%}"),
-        "sharpe_ratio":          ("Sharpe Ratio",       "{:.3f}"),
-        "sortino_ratio":         ("Sortino Ratio",      "{:.3f}"),
-        "max_drawdown":          ("Max Drawdown",       "{:.2%}"),
-        "max_dd_duration_days":  ("Max DD Duration",    "{:.0f} days"),
-        "win_rate":              ("Win Rate",           "{:.2%}"),
-        "profit_factor":         ("Profit Factor",      "{:.3f}"),
-        "num_trades":            ("# Trades",           "{:.0f}"),
-        "alpha":                 ("Alpha (annual)",     "{:.2%}"),
-        "beta":                  ("Beta",               "{:.3f}"),
-    }
+def _print_metrics(metrics: dict, strategy_name: str = "Strategy") -> None:
+    """Print a compact performance summary table."""
     import math
+    FMT = {
+        "total_return_pct":    ("Total Return",       "{:.2%}"),
+        "cagr":                ("CAGR",               "{:.2%}"),
+        "sharpe_ratio":        ("Sharpe Ratio",       "{:.3f}"),
+        "sortino_ratio":       ("Sortino Ratio",      "{:.3f}"),
+        "calmar_ratio":        ("Calmar Ratio",       "{:.3f}"),
+        "max_drawdown_pct":    ("Max Drawdown",       "{:.2%}"),
+        "win_rate":            ("Win Rate",           "{:.2%}"),
+        "profit_factor":       ("Profit Factor",      "{:.3f}"),
+        "total_trades":        ("# Trades",           "{:.0f}"),
+        "alpha":               ("Alpha (annual)",     "{:.2%}"),
+        "beta":                ("Beta",               "{:.3f}"),
+    }
     print("\n" + "─" * 50)
-    print("  PERFORMANCE SUMMARY")
+    print(f"  PERFORMANCE SUMMARY — {strategy_name}")
     print("─" * 50)
     for key, (label, fmt) in FMT.items():
         val = metrics.get(key)

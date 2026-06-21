@@ -1,459 +1,610 @@
 # reports/charts.py
 # ============================================================
-# CHART FUNCTIONS — MATPLOTLIB + PLOTLY
-# All functions accept pre-computed data (DataFrames/Series)
-# and return figure objects. Callers decide whether to save or show.
+# ALL CHART FUNCTIONS — MATPLOTLIB (PNG) AND PLOTLY (INTERACTIVE)
+# Each function accepts processed data and returns a figure.
 # ============================================================
 
-import logging
-import os
-from typing import Dict, List, Optional
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — safe for file saving
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
 import numpy as np
 import pandas as pd
+from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from config import BacktestConfig
 
-# Lazy imports so the module can be imported even if libs are missing
-def _get_mpl():
+_PALETTE = {
+    "portfolio": "#1f77b4",
+    "benchmark": "#9e9e9e",
+    "green":     "#2ca02c",
+    "red":       "#d62728",
+    "yellow":    "#ff7f0e",
+}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MATPLOTLIB CHARTS  (return plt.Figure, saved by caller)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plot_equity_curve(
+    equity_curve: pd.Series,
+    benchmark_curve: Optional[pd.Series],
+    config: BacktestConfig,
+    title: str = "Portfolio Equity Curve",
+) -> plt.Figure:
+    """Portfolio equity curve vs benchmark, indexed to 100 at start."""
+    style = getattr(config.report, "chart_style", "seaborn-v0_8-darkgrid")
     try:
-        import matplotlib
-        matplotlib.use("Agg")  # non-interactive backend for report generation
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from matplotlib.gridspec import GridSpec
-        return matplotlib, plt, mdates, GridSpec
-    except ImportError as e:
-        raise ImportError(f"matplotlib not installed. Run: pip install matplotlib. Error: {e}")
+        plt.style.use(style)
+    except Exception:
+        plt.style.use("ggplot")
 
+    fig, ax = plt.subplots(figsize=(14, 6))
 
-def _get_plotly():
-    try:
-        import plotly.graph_objects as go
-        import plotly.subplots as sp
-        return go, sp
-    except ImportError as e:
-        raise ImportError(f"plotly not installed. Run: pip install plotly. Error: {e}")
+    port_idx = equity_curve / equity_curve.iloc[0] * 100
+    ax.plot(port_idx.index, port_idx.values, color=_PALETTE["portfolio"],
+            linewidth=1.8, label="Portfolio")
+    ax.fill_between(port_idx.index, port_idx.values, 100,
+                    alpha=0.10, color=_PALETTE["portfolio"])
 
+    if benchmark_curve is not None and len(benchmark_curve) > 0:
+        bm_idx = benchmark_curve / benchmark_curve.iloc[0] * 100
+        # Align to portfolio dates
+        bm_aligned = bm_idx.reindex(port_idx.index, method="ffill")
+        ax.plot(bm_aligned.index, bm_aligned.values, color=_PALETTE["benchmark"],
+                linewidth=1.2, linestyle="--", label="Nifty 50")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MATPLOTLIB CHARTS (static PNGs)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def equity_curve_chart(
-    equity: pd.Series,
-    benchmark_equity: Optional[pd.Series] = None,
-    strategy_name: str = "Strategy",
-    chart_style: str = "seaborn-v0_8",
-    save_path: Optional[str] = None,
-):
-    """
-    Plot equity curve with drawdown panel.
-
-    Parameters
-    ----------
-    equity           : pd.Series indexed by datetime — portfolio equity.
-    benchmark_equity : pd.Series or None — benchmark equity (normalised to same start).
-    strategy_name    : str — chart title label.
-    chart_style      : str — matplotlib style name.
-    save_path        : str or None — if given, save PNG to this path.
-
-    Returns
-    -------
-    matplotlib Figure object.
-    """
-    matplotlib, plt, mdates, GridSpec = _get_mpl()
-
-    try:
-        plt.style.use(chart_style)
-    except OSError:
-        plt.style.use("seaborn-v0_8" if "seaborn" not in chart_style else "ggplot")
-
-    fig = plt.figure(figsize=(14, 8))
-    gs  = GridSpec(3, 1, figure=fig, height_ratios=[3, 1, 1], hspace=0.08)
-
-    ax_eq  = fig.add_subplot(gs[0])
-    ax_dd  = fig.add_subplot(gs[1], sharex=ax_eq)
-    ax_ret = fig.add_subplot(gs[2], sharex=ax_eq)
-
-    # ── Equity curve ─────────────────────────────────────────────────────
-    norm_equity = equity / equity.iloc[0] * 100
-    ax_eq.plot(equity.index, norm_equity, label=strategy_name, linewidth=1.8, color="#2196F3")
-
-    if benchmark_equity is not None and len(benchmark_equity) > 1:
-        norm_bench = benchmark_equity / benchmark_equity.iloc[0] * 100
-        ax_eq.plot(
-            benchmark_equity.index, norm_bench,
-            label="Benchmark", linewidth=1.2, color="#FF9800", alpha=0.8, linestyle="--"
-        )
-
-    ax_eq.axhline(100, color="gray", linewidth=0.8, linestyle=":")
-    ax_eq.set_ylabel("Normalised Value (base=100)")
-    ax_eq.set_title(f"{strategy_name} — Equity Curve & Drawdown", fontsize=13, fontweight="bold")
-    ax_eq.legend(loc="upper left", framealpha=0.8)
-    ax_eq.yaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%.0f"))
-
-    # ── Drawdown ─────────────────────────────────────────────────────────
-    rolling_max = equity.cummax()
-    drawdown    = (equity - rolling_max) / rolling_max * 100
-    ax_dd.fill_between(drawdown.index, drawdown, 0, color="#F44336", alpha=0.5, label="Drawdown")
-    ax_dd.set_ylabel("Drawdown %")
-    ax_dd.legend(loc="lower left", framealpha=0.8)
-
-    # ── Daily returns ─────────────────────────────────────────────────────
-    daily_ret = equity.pct_change().dropna() * 100
-    colors = ["#4CAF50" if r >= 0 else "#F44336" for r in daily_ret]
-    ax_ret.bar(daily_ret.index, daily_ret, color=colors, width=1, alpha=0.7)
-    ax_ret.axhline(0, color="gray", linewidth=0.6)
-    ax_ret.set_ylabel("Daily Ret %")
-
-    # ── X-axis formatting ─────────────────────────────────────────────────
-    ax_ret.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
-    ax_ret.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
-    plt.setp(ax_eq.get_xticklabels(), visible=False)
-    plt.setp(ax_dd.get_xticklabels(), visible=False)
-    fig.autofmt_xdate(rotation=30)
-
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        logger.info("Saved equity chart → %s", save_path)
-
+    ax.axhline(y=100, color="black", linewidth=0.8, linestyle=":")
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Indexed Value (Base 100)")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
     return fig
 
 
-def monthly_returns_heatmap(
-    equity: pd.Series,
-    chart_style: str = "seaborn-v0_8",
-    save_path: Optional[str] = None,
-):
-    """
-    Monthly returns heatmap (seaborn-style table).
+def plot_drawdown(
+    equity_curve: pd.Series,
+    config: BacktestConfig,
+    title: str = "Drawdown Over Time",
+) -> plt.Figure:
+    """Drawdown percentage as a filled red area chart."""
+    running_max = equity_curve.cummax()
+    drawdown    = (equity_curve - running_max) / running_max
 
-    Rows = year, Columns = month, Cells = monthly return %.
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(drawdown.index, drawdown.values * 100,
+            color=_PALETTE["red"], linewidth=1.2, label="Drawdown")
+    ax.fill_between(drawdown.index, drawdown.values * 100, 0,
+                    alpha=0.30, color=_PALETTE["red"])
 
-    Returns
-    -------
-    matplotlib Figure object.
-    """
-    matplotlib, plt, mdates, GridSpec = _get_mpl()
-    try:
-        import seaborn as sns
-        _have_sns = True
-    except ImportError:
-        _have_sns = False
-
-    monthly = equity.resample("ME").last().pct_change().dropna() * 100
-    monthly.index = pd.DatetimeIndex(monthly.index)
-
-    df = pd.DataFrame({
-        "year":  monthly.index.year,
-        "month": monthly.index.month,
-        "ret":   monthly.values,
-    })
-    pivot = df.pivot(index="year", columns="month", values="ret")
-    pivot.columns = [
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    ]
-
-    fig, ax = plt.subplots(figsize=(14, max(4, len(pivot) * 0.6)))
-    if _have_sns:
-        sns.heatmap(
-            pivot, annot=True, fmt=".1f", center=0,
-            cmap="RdYlGn", linewidths=0.5, ax=ax,
-            cbar_kws={"label": "Return %"},
-        )
-    else:
-        im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn")
-        ax.set_xticks(range(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns)
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels(pivot.index)
-        plt.colorbar(im, ax=ax, label="Return %")
-        for i in range(pivot.shape[0]):
-            for j in range(pivot.shape[1]):
-                v = pivot.values[i, j]
-                if not np.isnan(v):
-                    ax.text(j, i, f"{v:.1f}", ha="center", va="center", fontsize=7)
-
-    ax.set_title("Monthly Returns Heatmap (%)", fontsize=12, fontweight="bold")
-    plt.tight_layout()
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        logger.info("Saved monthly heatmap → %s", save_path)
-
-    return fig
-
-
-def trade_analysis_chart(
-    trade_log: pd.DataFrame,
-    chart_style: str = "seaborn-v0_8",
-    save_path: Optional[str] = None,
-):
-    """
-    3-panel trade analysis chart:
-      - PnL distribution histogram
-      - Cumulative PnL over time
-      - Rolling win-rate (20-trade window)
-
-    Returns
-    -------
-    matplotlib Figure object.
-    """
-    matplotlib, plt, mdates, GridSpec = _get_mpl()
-
-    exits = trade_log[trade_log["type"] == "EXIT"].copy()
-    if exits.empty:
-        logger.warning("No exit trades found — skipping trade analysis chart.")
-        return None
-
-    exits = exits.sort_values("date")
-    pnl   = exits["realised_pnl"].values
-
-    try:
-        plt.style.use(chart_style)
-    except OSError:
-        pass
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Trade Analysis", fontsize=13, fontweight="bold")
-
-    # ── PnL Distribution ─────────────────────────────────────────────────
-    ax = axes[0]
-    colors = ["#4CAF50" if p >= 0 else "#F44336" for p in pnl]
-    ax.hist(pnl, bins=30, color="#2196F3", edgecolor="white", alpha=0.8)
-    ax.axvline(0, color="black", linewidth=1.2, linestyle="--")
-    ax.axvline(pnl.mean(), color="orange", linewidth=1.2, linestyle="-.", label=f"Mean={pnl.mean():.0f}")
-    ax.set_xlabel("Realised PnL (₹)")
-    ax.set_ylabel("Frequency")
-    ax.set_title("PnL Distribution")
-    ax.legend()
-
-    # ── Cumulative PnL ───────────────────────────────────────────────────
-    ax = axes[1]
-    cum_pnl = pd.Series(pnl).cumsum()
-    cum_pnl.index = range(len(cum_pnl))
-    pos_mask = cum_pnl >= 0
-    ax.fill_between(cum_pnl.index, cum_pnl, 0,
-                    where=pos_mask, color="#4CAF50", alpha=0.5, label="Profit")
-    ax.fill_between(cum_pnl.index, cum_pnl, 0,
-                    where=~pos_mask, color="#F44336", alpha=0.5, label="Loss")
-    ax.axhline(0, color="gray", linewidth=0.8)
-    ax.set_xlabel("Trade #")
-    ax.set_ylabel("Cumulative PnL (₹)")
-    ax.set_title("Cumulative PnL")
-    ax.legend()
-
-    # ── Rolling Win-Rate ─────────────────────────────────────────────────
-    ax = axes[2]
-    wins        = (pd.Series(pnl) > 0).astype(float)
-    rolling_wr  = wins.rolling(window=20, min_periods=5).mean() * 100
-    ax.plot(rolling_wr.values, color="#9C27B0", linewidth=1.5)
-    ax.axhline(50, color="gray", linewidth=0.8, linestyle="--", label="50%")
-    ax.set_xlabel("Trade #")
-    ax.set_ylabel("Win Rate %")
-    ax.set_title("Rolling Win-Rate (20 trades)")
-    ax.set_ylim(0, 100)
-    ax.legend()
-
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        logger.info("Saved trade analysis chart → %s", save_path)
-
-    return fig
-
-
-def walk_forward_summary_chart(
-    wf_summary: pd.DataFrame,
-    metric: str = "sharpe_ratio",
-    chart_style: str = "seaborn-v0_8",
-    save_path: Optional[str] = None,
-):
-    """
-    Bar chart of a chosen metric across walk-forward splits.
-
-    Returns
-    -------
-    matplotlib Figure object.
-    """
-    matplotlib, plt, mdates, GridSpec = _get_mpl()
-
-    df = wf_summary[wf_summary["split"] != "MEAN"].copy()
-    if metric not in df.columns:
-        logger.warning("Metric '%s' not found in walk-forward summary.", metric)
-        return None
-
-    try:
-        plt.style.use(chart_style)
-    except OSError:
-        pass
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    vals   = df[metric].astype(float)
-    labels = [f"Split {int(s)}" for s in df["split"]]
-    colors = ["#4CAF50" if v >= 0 else "#F44336" for v in vals]
-
-    bars = ax.bar(labels, vals, color=colors, edgecolor="white", alpha=0.85)
-    ax.axhline(0, color="gray", linewidth=0.8)
-
-    mean_val = wf_summary[wf_summary["split"] == "MEAN"][metric].values
-    if len(mean_val):
-        ax.axhline(
-            float(mean_val[0]), color="orange", linewidth=1.5,
-            linestyle="--", label=f"Mean={float(mean_val[0]):.3f}"
-        )
-
-    ax.set_xlabel("Walk-Forward Split")
-    ax.set_ylabel(metric.replace("_", " ").title())
-    ax.set_title(f"Walk-Forward {metric.replace('_', ' ').title()} per Split", fontweight="bold")
-    ax.legend()
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        logger.info("Saved walk-forward chart → %s", save_path)
-
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PLOTLY INTERACTIVE CHART
-# ══════════════════════════════════════════════════════════════════════════════
-
-def interactive_equity_chart(
-    equity: pd.Series,
-    benchmark_equity: Optional[pd.Series] = None,
-    trade_log: Optional[pd.DataFrame] = None,
-    strategy_name: str = "Strategy",
-    save_path: Optional[str] = None,
-):
-    """
-    Plotly interactive equity curve with drawdown, volume-of-trades, and
-    optional trade markers.
-
-    Parameters
-    ----------
-    equity           : pd.Series — portfolio equity indexed by datetime.
-    benchmark_equity : pd.Series or None.
-    trade_log        : pd.DataFrame or None — to overlay entry/exit markers.
-    strategy_name    : str.
-    save_path        : str or None — if given, save as HTML file.
-
-    Returns
-    -------
-    plotly Figure object.
-    """
-    go, sp = _get_plotly()
-
-    rows = 3
-    fig  = sp.make_subplots(
-        rows=rows, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.55, 0.25, 0.20],
-        vertical_spacing=0.04,
-        subplot_titles=["Equity Curve", "Drawdown", "Daily Returns"],
+    trough_date = drawdown.idxmin()
+    max_dd      = drawdown.min()
+    ax.axvline(x=trough_date, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.annotate(
+        f"Max DD: {max_dd:.1%}",
+        xy=(trough_date, max_dd * 100),
+        xytext=(20, -10),
+        textcoords="offset points",
+        fontsize=9,
+        arrowprops={"arrowstyle": "->", "color": "black"},
     )
 
-    # ── Equity ───────────────────────────────────────────────────────────
-    norm = equity / equity.iloc[0] * 100
-    fig.add_trace(
-        go.Scatter(
-            x=equity.index, y=norm,
-            name=strategy_name, line=dict(color="#2196F3", width=2),
-        ),
-        row=1, col=1,
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter())
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Drawdown (%)")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    return fig
+
+
+def plot_monthly_returns_heatmap(
+    monthly_returns: pd.DataFrame,
+    config: BacktestConfig,
+    title: str = "Monthly Returns Heatmap",
+) -> plt.Figure:
+    """Calendar heatmap — rows = years, columns = months."""
+    n_rows = max(4, len(monthly_returns))
+    fig, ax = plt.subplots(figsize=(13, n_rows * 0.65 + 2))
+
+    sns.heatmap(
+        monthly_returns * 100,
+        annot=True,
+        fmt=".1f",
+        cmap="RdYlGn",
+        center=0,
+        linewidths=0.5,
+        linecolor="white",
+        ax=ax,
+        cbar_kws={"label": "Return (%)", "shrink": 0.6},
+    )
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Year")
+    plt.setp(ax.get_xticklabels(), rotation=0)
+    plt.setp(ax.get_yticklabels(), rotation=0)
+    fig.tight_layout()
+    return fig
+
+
+def plot_trade_distribution(
+    trade_log: List[dict],
+    config: BacktestConfig,
+    title: str = "Trade P&L Distribution",
+) -> plt.Figure:
+    """Histogram of trade P&L with win/loss breakdown."""
+    if not trade_log:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.text(0.5, 0.5, "No completed trades", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14)
+        ax.set_title(title)
+        return fig
+
+    pnls   = [t["net_pnl"] for t in trade_log]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.01)
+
+    # Histogram of P&L
+    colors = [_PALETTE["green"] if p > 0 else _PALETTE["red"] for p in pnls]
+    ax1.hist(pnls, bins=min(30, len(pnls)), edgecolor="white", color=_PALETTE["portfolio"])
+    ax1.axvline(x=0, color="black", linewidth=1.2, linestyle="--")
+    ax1.set_title("P&L Distribution")
+    ax1.set_xlabel("Net P&L (₹)")
+    ax1.set_ylabel("Frequency")
+    ax1.grid(True, alpha=0.4)
+
+    # Win/Loss bar count
+    counts = [len(wins), len(losses)]
+    bar_colors = [_PALETTE["green"], _PALETTE["red"]]
+    bars = ax2.bar(["Wins", "Losses"], counts, color=bar_colors, edgecolor="white")
+    for bar, cnt in zip(bars, counts):
+        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                 str(cnt), ha="center", va="bottom", fontsize=11, fontweight="bold")
+    ax2.set_title("Win / Loss Count")
+    ax2.set_ylabel("Number of Trades")
+    ax2.grid(True, alpha=0.4, axis="y")
+
+    # Stats annotation
+    win_rate = len(wins) / len(pnls) if pnls else 0
+    avg_win  = float(np.mean(wins))   if wins   else 0
+    avg_loss = float(np.mean(losses)) if losses else 0
+    pf       = abs(sum(wins) / sum(losses)) if sum(losses) != 0 else float("inf")
+    stats    = (
+        f"Win Rate:       {win_rate:.1%}\n"
+        f"Profit Factor:  {pf:.2f}\n"
+        f"Avg Win:  ₹{avg_win:>10,.0f}\n"
+        f"Avg Loss: ₹{avg_loss:>10,.0f}"
+    )
+    ax1.annotate(
+        stats, xy=(0.98, 0.97), xycoords="axes fraction",
+        ha="right", va="top", fontsize=9,
+        bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "alpha": 0.8},
+    )
+    fig.tight_layout()
+    return fig
+
+
+def plot_rolling_sharpe(
+    rolling_sharpe: pd.Series,
+    config: BacktestConfig,
+    title: str = "Rolling 252-Day Sharpe Ratio",
+) -> plt.Figure:
+    """Rolling Sharpe over time — shows strategy consistency."""
+    fig, ax = plt.subplots(figsize=(14, 4))
+
+    ax.plot(rolling_sharpe.index, rolling_sharpe.values,
+            color=_PALETTE["portfolio"], linewidth=1.5, label="Rolling Sharpe")
+    ax.axhline(y=0,   color="black",  linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.axhline(y=1.0, color=_PALETTE["green"], linewidth=0.8,
+               linestyle="--", alpha=0.7, label="Sharpe = 1.0")
+
+    ax.fill_between(
+        rolling_sharpe.index, rolling_sharpe.values, 0,
+        where=rolling_sharpe.values >= 0,
+        alpha=0.15, color=_PALETTE["green"],
+    )
+    ax.fill_between(
+        rolling_sharpe.index, rolling_sharpe.values, 0,
+        where=rolling_sharpe.values < 0,
+        alpha=0.15, color=_PALETTE["red"],
     )
 
-    if benchmark_equity is not None and len(benchmark_equity) > 1:
-        norm_b = benchmark_equity / benchmark_equity.iloc[0] * 100
-        fig.add_trace(
-            go.Scatter(
-                x=benchmark_equity.index, y=norm_b,
-                name="Benchmark", line=dict(color="#FF9800", width=1.5, dash="dash"),
-                opacity=0.8,
-            ),
-            row=1, col=1,
-        )
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Sharpe Ratio")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    return fig
 
-    # Trade markers
-    if trade_log is not None and not trade_log.empty:
-        entries = trade_log[trade_log["type"] == "ENTRY"]
-        exits   = trade_log[trade_log["type"] == "EXIT"]
 
-        def _equity_at(dates):
-            ts = pd.to_datetime(dates)
-            return [
-                float(equity.reindex([t], method="nearest").values[0])
-                / equity.iloc[0] * 100
-                if len(equity.reindex([t], method="nearest")) > 0 else None
-                for t in ts
-            ]
+def plot_walk_forward_results(
+    wf_df: pd.DataFrame,
+    config: BacktestConfig,
+    title: str = "Walk-Forward Out-of-Sample Results",
+) -> plt.Figure:
+    """Grouped bar chart of Sharpe and CAGR per walk-forward test window."""
+    # Drop the aggregate 'MEAN' row for plotting
+    df = wf_df[wf_df["Split"] != "MEAN"].copy() if "Split" in wf_df.columns else wf_df.copy()
 
-        if not entries.empty:
-            fig.add_trace(go.Scatter(
-                x=pd.to_datetime(entries["date"]),
-                y=_equity_at(entries["date"]),
-                mode="markers",
-                name="Entry",
-                marker=dict(symbol="triangle-up", size=8, color="#4CAF50"),
-            ), row=1, col=1)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.01)
 
-        if not exits.empty:
-            fig.add_trace(go.Scatter(
-                x=pd.to_datetime(exits["date"]),
-                y=_equity_at(exits["date"]),
-                mode="markers",
-                name="Exit",
-                marker=dict(symbol="triangle-down", size=8, color="#F44336"),
-            ), row=1, col=1)
+    x_labels = df.get("Test Start", df.index.astype(str)).tolist()
+    x        = np.arange(len(x_labels))
 
-    # ── Drawdown ─────────────────────────────────────────────────────────
-    rolling_max = equity.cummax()
-    drawdown    = (equity - rolling_max) / rolling_max * 100
-    fig.add_trace(
-        go.Scatter(
-            x=drawdown.index, y=drawdown,
-            name="Drawdown", fill="tozeroy",
-            line=dict(color="#F44336", width=1),
-            fillcolor="rgba(244,67,54,0.3)",
+    def _colour(val: float) -> str:
+        if val >= 1.0: return _PALETTE["green"]
+        if val >= 0.0: return _PALETTE["yellow"]
+        return _PALETTE["red"]
+
+    sharpe_col = "Sharpe" if "Sharpe" in df.columns else "sharpe_ratio"
+    cagr_col   = "CAGR"   if "CAGR"   in df.columns else "cagr"
+
+    if sharpe_col in df.columns:
+        sharpe_vals = df[sharpe_col].astype(float)
+        ax1.bar(x, sharpe_vals, color=[_colour(v) for v in sharpe_vals], edgecolor="white")
+        ax1.axhline(sharpe_vals.mean(), color="black", linewidth=1.2, linestyle="--",
+                    label=f"Mean = {sharpe_vals.mean():.2f}")
+        ax1.set_ylabel("Sharpe Ratio")
+        ax1.set_title("Sharpe Ratio per Test Window")
+        ax1.legend(loc="upper right")
+        ax1.grid(True, alpha=0.4, axis="y")
+
+    if cagr_col in df.columns:
+        cagr_vals = df[cagr_col].astype(float)
+        ax2.bar(x, cagr_vals * 100, color=[_colour(v) for v in cagr_vals], edgecolor="white")
+        ax2.axhline(cagr_vals.mean() * 100, color="black", linewidth=1.2, linestyle="--",
+                    label=f"Mean = {cagr_vals.mean():.1%}")
+        ax2.set_ylabel("CAGR (%)")
+        ax2.set_title("CAGR per Test Window")
+        ax2.legend(loc="upper right")
+        ax2.grid(True, alpha=0.4, axis="y")
+
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([str(lbl)[:7] for lbl in x_labels], rotation=30, ha="right")
+    fig.tight_layout()
+    return fig
+
+
+def plot_ma_signals(
+    bars: pd.DataFrame,
+    fast_ma: pd.Series,
+    slow_ma: pd.Series,
+    trade_log: List[dict],
+    symbol: str,
+    config: BacktestConfig,
+) -> plt.Figure:
+    """Debug chart: close price with MA lines and entry/exit trade markers."""
+    fig, ax = plt.subplots(figsize=(16, 7))
+
+    ax.plot(bars.index, bars["close"], color="black", linewidth=1.0, label="Close")
+    ax.plot(fast_ma.index, fast_ma.values, color=_PALETTE["portfolio"],
+            linewidth=1.2, label=f"Fast MA ({config.strategy.fast_ma_window})")
+    ax.plot(slow_ma.index, slow_ma.values, color=_PALETTE["yellow"],
+            linewidth=1.2, label=f"Slow MA ({config.strategy.slow_ma_window})")
+
+    for t in trade_log:
+        if t.get("symbol") != symbol:
+            continue
+        try:
+            entry_dt = pd.Timestamp(t["entry_date"])
+            exit_dt  = pd.Timestamp(t["exit_date"])
+            ax.annotate(
+                "▲", xy=(entry_dt, t["entry_price"]),
+                fontsize=12, color=_PALETTE["green"],
+                ha="center", va="bottom",
+            )
+            ax.annotate(
+                "▼", xy=(exit_dt, t["exit_price"]),
+                fontsize=12, color=_PALETTE["red"],
+                ha="center", va="top",
+            )
+        except Exception:
+            pass
+
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.set_title(f"Dual MA Signals — {symbol}", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price (₹)")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    return fig
+
+
+def plot_rsi_signals(
+    bars: pd.DataFrame,
+    rsi: pd.Series,
+    trade_log: List[dict],
+    symbol: str,
+    config: BacktestConfig,
+    oversold: float = 30.0,
+    overbought: float = 70.0,
+) -> plt.Figure:
+    """Debug chart: price with trade markers (top) and RSI with bands (bottom)."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 8), sharex=True,
+                                    gridspec_kw={"height_ratios": [3, 2]})
+
+    ax1.plot(bars.index, bars["close"], color="black", linewidth=1.0, label="Close")
+    for t in trade_log:
+        if t.get("symbol") != symbol:
+            continue
+        try:
+            ax1.annotate(
+                "▲", xy=(pd.Timestamp(t["entry_date"]), t["entry_price"]),
+                fontsize=12, color=_PALETTE["green"], ha="center", va="bottom",
+            )
+            ax1.annotate(
+                "▼", xy=(pd.Timestamp(t["exit_date"]), t["exit_price"]),
+                fontsize=12, color=_PALETTE["red"], ha="center", va="top",
+            )
+        except Exception:
+            pass
+    ax1.set_title(f"RSI Signals — {symbol}", fontsize=14, fontweight="bold", pad=12)
+    ax1.set_ylabel("Price (₹)")
+    ax1.legend(loc="upper left")
+    ax1.grid(True, alpha=0.4)
+
+    ax2.plot(rsi.index, rsi.values, color=_PALETTE["portfolio"], linewidth=1.2)
+    ax2.axhline(overbought, color=_PALETTE["red"],   linestyle="--", linewidth=0.9)
+    ax2.axhline(oversold,   color=_PALETTE["green"], linestyle="--", linewidth=0.9)
+    ax2.fill_between(rsi.index, rsi.values, overbought,
+                     where=rsi.values >= overbought, alpha=0.20, color=_PALETTE["red"])
+    ax2.fill_between(rsi.index, rsi.values, oversold,
+                     where=rsi.values <= oversold,   alpha=0.20, color=_PALETTE["green"])
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel("RSI")
+    ax2.set_xlabel("Date")
+    ax2.grid(True, alpha=0.4)
+    ax2.xaxis.set_major_locator(mdates.YearLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    fig.tight_layout()
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PLOTLY INTERACTIVE CHARTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plotly_equity_curve(
+    equity_curve: pd.Series,
+    benchmark_curve: Optional[pd.Series],
+    metrics: dict,
+) -> go.Figure:
+    """Interactive equity curve with hover tooltips and metric annotation."""
+    port_idx = equity_curve / equity_curve.iloc[0] * 100
+    fig      = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=port_idx.index, y=port_idx.values,
+        name="Portfolio", mode="lines",
+        line={"color": _PALETTE["portfolio"], "width": 2},
+        hovertemplate="<b>Portfolio</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:.1f}<extra></extra>",
+    ))
+
+    if benchmark_curve is not None and len(benchmark_curve) > 0:
+        bm_idx = benchmark_curve / benchmark_curve.iloc[0] * 100
+        bm_idx = bm_idx.reindex(port_idx.index, method="ffill")
+        fig.add_trace(go.Scatter(
+            x=bm_idx.index, y=bm_idx.values,
+            name="Nifty 50", mode="lines",
+            line={"color": _PALETTE["benchmark"], "width": 1.5, "dash": "dash"},
+            hovertemplate="<b>Nifty 50</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:.1f}<extra></extra>",
+        ))
+
+    sharpe = metrics.get("sharpe_ratio", 0)
+    cagr   = metrics.get("cagr", 0)
+    max_dd = metrics.get("max_drawdown_pct", 0)
+
+    fig.add_annotation(
+        x=0.01, y=0.97, xref="paper", yref="paper",
+        text=(
+            f"<b>Sharpe:</b> {sharpe:.2f}  |  "
+            f"<b>CAGR:</b> {cagr:.1%}  |  "
+            f"<b>Max DD:</b> {max_dd:.1%}"
         ),
-        row=2, col=1,
-    )
-
-    # ── Daily returns ─────────────────────────────────────────────────────
-    daily_ret = equity.pct_change().dropna() * 100
-    colors    = ["#4CAF50" if r >= 0 else "#F44336" for r in daily_ret]
-    fig.add_trace(
-        go.Bar(
-            x=daily_ret.index, y=daily_ret,
-            name="Daily Ret %", marker_color=colors, opacity=0.6,
-        ),
-        row=3, col=1,
+        showarrow=False, align="left",
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="lightgrey", borderwidth=1,
+        font={"size": 12},
     )
 
     fig.update_layout(
-        title=f"<b>{strategy_name}</b> — Interactive Performance",
-        height=700,
+        title="Portfolio Equity Curve vs Benchmark (Indexed to 100)",
+        xaxis_title="Date",
+        yaxis_title="Indexed Value",
         hovermode="x unified",
-        showlegend=True,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
+        height=450,
         template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    fig.update_yaxes(title_text="Value (base=100)", row=1, col=1)
-    fig.update_yaxes(title_text="DD %",  row=2, col=1)
-    fig.update_yaxes(title_text="Ret %", row=3, col=1)
+    return fig
 
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.write_html(save_path, include_plotlyjs="cdn")
-        logger.info("Saved interactive chart → %s", save_path)
 
+def plotly_drawdown(equity_curve: pd.Series) -> go.Figure:
+    """Interactive drawdown area chart."""
+    running_max = equity_curve.cummax()
+    drawdown    = (equity_curve - running_max) / running_max * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=drawdown.index, y=drawdown.values,
+        name="Drawdown",
+        mode="lines",
+        fill="tozeroy",
+        fillcolor="rgba(214,39,40,0.2)",
+        line={"color": "rgba(214,39,40,0.8)", "width": 1.2},
+        hovertemplate="<b>Drawdown</b><br>Date: %{x|%Y-%m-%d}<br>DD: %{y:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Drawdown Over Time",
+        xaxis_title="Date",
+        yaxis_title="Drawdown (%)",
+        hovermode="x unified",
+        height=350,
+        template="plotly_white",
+    )
+    return fig
+
+
+def plotly_monthly_heatmap(monthly_returns: pd.DataFrame) -> go.Figure:
+    """Interactive Plotly heatmap of monthly returns."""
+    data_pct  = (monthly_returns * 100).round(2)
+    text_vals = [[f"{v:.1f}%" if not np.isnan(v) else "" for v in row]
+                 for row in data_pct.values]
+
+    fig = go.Figure(go.Heatmap(
+        z=data_pct.values,
+        x=data_pct.columns.tolist(),
+        y=data_pct.index.tolist(),
+        text=text_vals,
+        texttemplate="%{text}",
+        colorscale="RdYlGn",
+        zmid=0,
+        colorbar={"title": "Return (%)"},
+        hovertemplate=(
+            "<b>%{y} %{x}</b><br>Return: %{z:.2f}%<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title="Monthly Returns Heatmap",
+        xaxis_title="Month",
+        yaxis_title="Year",
+        height=max(250, len(monthly_returns) * 40 + 100),
+        template="plotly_white",
+    )
+    return fig
+
+
+def plotly_combined_dashboard(
+    equity_curve: pd.Series,
+    benchmark_curve: Optional[pd.Series],
+    trade_log: List[dict],
+    metrics: dict,
+    monthly_returns: pd.DataFrame,
+) -> go.Figure:
+    """
+    A single multi-panel Plotly dashboard (2 × 2 grid):
+      Row 1, Col 1 — Equity curve vs benchmark
+      Row 1, Col 2 — Monthly returns heatmap
+      Row 2, Col 1 — Drawdown
+      Row 2, Col 2 — Trade P&L histogram
+    """
+    specs = [
+        [{"type": "xy"},      {"type": "heatmap"}],
+        [{"type": "xy"},      {"type": "xy"}],
+    ]
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "Equity Curve vs Benchmark",
+            "Monthly Returns Heatmap",
+            "Drawdown",
+            "Trade P&L Distribution",
+        ),
+        specs=specs,
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08,
+    )
+
+    # ── Equity curve (1,1) ────────────────────────────────────────────────
+    port_idx = equity_curve / equity_curve.iloc[0] * 100
+    fig.add_trace(
+        go.Scatter(x=port_idx.index, y=port_idx.values,
+                   name="Portfolio", mode="lines",
+                   line={"color": _PALETTE["portfolio"], "width": 2}),
+        row=1, col=1,
+    )
+    if benchmark_curve is not None and len(benchmark_curve) > 0:
+        bm_idx = (benchmark_curve / benchmark_curve.iloc[0] * 100).reindex(
+            port_idx.index, method="ffill"
+        )
+        fig.add_trace(
+            go.Scatter(x=bm_idx.index, y=bm_idx.values,
+                       name="Nifty 50", mode="lines",
+                       line={"color": _PALETTE["benchmark"], "width": 1.2, "dash": "dash"}),
+            row=1, col=1,
+        )
+
+    # ── Monthly heatmap (1,2) ─────────────────────────────────────────────
+    data_pct  = (monthly_returns * 100).round(2)
+    text_vals = [[f"{v:.1f}%" if not np.isnan(v) else "" for v in row]
+                 for row in data_pct.values]
+    fig.add_trace(
+        go.Heatmap(
+            z=data_pct.values, x=data_pct.columns.tolist(),
+            y=data_pct.index.tolist(), text=text_vals,
+            texttemplate="%{text}", colorscale="RdYlGn", zmid=0, showscale=False,
+        ),
+        row=1, col=2,
+    )
+
+    # ── Drawdown (2,1) ────────────────────────────────────────────────────
+    running_max = equity_curve.cummax()
+    drawdown    = (equity_curve - running_max) / running_max * 100
+    fig.add_trace(
+        go.Scatter(x=drawdown.index, y=drawdown.values,
+                   name="Drawdown", mode="lines",
+                   fill="tozeroy",
+                   fillcolor="rgba(214,39,40,0.15)",
+                   line={"color": "rgba(214,39,40,0.8)", "width": 1}),
+        row=2, col=1,
+    )
+
+    # ── Trade P&L histogram (2,2) ─────────────────────────────────────────
+    if trade_log:
+        pnls = [t["net_pnl"] for t in trade_log]
+        colors = [_PALETTE["green"] if p > 0 else _PALETTE["red"] for p in pnls]
+        fig.add_trace(
+            go.Bar(x=list(range(len(pnls))), y=pnls,
+                   name="Trade P&L", marker_color=colors, showlegend=False),
+            row=2, col=2,
+        )
+
+    # ── Metric tiles as title annotations ─────────────────────────────────
+    sharpe  = metrics.get("sharpe_ratio", 0)
+    cagr    = metrics.get("cagr", 0)
+    max_dd  = metrics.get("max_drawdown_pct", 0)
+    wr      = metrics.get("win_rate", 0)
+    pf      = metrics.get("profit_factor", 0)
+    tiles   = (
+        f"<b>Sharpe</b> {sharpe:.2f}  ·  "
+        f"<b>CAGR</b> {cagr:.1%}  ·  "
+        f"<b>Max DD</b> {max_dd:.1%}  ·  "
+        f"<b>Win Rate</b> {wr:.1%}  ·  "
+        f"<b>PF</b> {pf:.2f}"
+    )
+    fig.update_layout(
+        title={
+            "text": f"Backtest Dashboard<br><sup>{tiles}</sup>",
+            "x": 0.5, "xanchor": "center",
+        },
+        height=800,
+        hovermode="x unified",
+        template="plotly_white",
+        showlegend=True,
+    )
     return fig

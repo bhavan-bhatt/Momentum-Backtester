@@ -1,9 +1,8 @@
 # engine/portfolio.py
 # ============================================================
-# POSITION SIZING + CASH MANAGEMENT + PORTFOLIO STATE
-# Receives SignalEvents via process_signal(), computes position size,
-# emits OrderEvents. Receives FillEvents via update_portfolio_on_fill(),
-# updates holdings and cash.
+# PORTFOLIO MANAGER — POSITION SIZING, CASH, AND HOLDINGS
+# Receives SignalEvents, computes order size, emits OrderEvents.
+# Receives FillEvents, updates cash and holdings.
 # ============================================================
 
 import logging
@@ -15,399 +14,361 @@ import numpy as np
 import pandas as pd
 
 from engine.events import (
-    SignalEvent,
-    SignalDirection,
-    OrderEvent,
-    OrderDirection,
-    FillEvent,
+    SignalEvent, OrderEvent, FillEvent,
+    OrderDirection, SignalDirection,
 )
-from engine.data_handler import DataHandler
 from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
 
 
-class Position:
-    """Represents a single open position."""
-
-    __slots__ = ("symbol", "quantity", "avg_cost", "entry_date", "strategy_id")
-
-    def __init__(
-        self,
-        symbol: str,
-        quantity: int,
-        avg_cost: float,
-        entry_date: datetime,
-        strategy_id: str = "",
-    ) -> None:
-        self.symbol      = symbol
-        self.quantity    = quantity
-        self.avg_cost    = avg_cost
-        self.entry_date  = entry_date
-        self.strategy_id = strategy_id
-
-    def market_value(self, current_price: float) -> float:
-        return self.quantity * current_price
-
-    def unrealised_pnl(self, current_price: float) -> float:
-        return self.quantity * (current_price - self.avg_cost)
-
-    def __repr__(self) -> str:
-        return (
-            f"Position({self.symbol}, qty={self.quantity}, "
-            f"avg_cost={self.avg_cost:.2f})"
-        )
-
-
 class PortfolioManager:
     """
-    Manages portfolio state: cash, open positions, equity curve, and trade log.
+    Manages the portfolio's capital, positions, and risk controls.
 
-    Public API (called by BacktestEngine)
-    --------------------------------------
-    process_signal(signal, data_handler)   — size and emit an OrderEvent.
-    update_portfolio_on_fill(fill)          — update cash/holdings from a fill.
-    update_equity_curve(timestamp)          — snapshot equity at end of each bar.
-    calculate_equity_curve()               — return full equity curve as pd.Series.
-    get_trade_log()                        — return trade log as pd.DataFrame.
-
-    Position Sizing Methods
-    -----------------------
-    "atr"          — Volatility-adjusted: risk_pct × equity / (ATR × multiplier).
-    "equal_weight" — equity / max_open_positions per signal.
-    "fixed"        — fixed_quantity shares per trade.
+    Internal State
+    --------------
+    cash            : float                   — Uninvested cash in INR.
+    holdings        : Dict[str, dict]          — Open positions.
+                      Each value: {quantity, avg_cost, entry_date, entry_price, strategy_id}
+    equity_curve    : list[(datetime, float)]  — (date, total_portfolio_value) snapshots.
+    trade_log       : list[dict]               — One dict per CLOSED trade.
+    _pending_orders : Dict[str, OrderEvent]    — Orders awaiting fills (dedup guard).
     """
 
-    def __init__(
-        self,
-        config: BacktestConfig,
-        data_handler: DataHandler,
-        event_queue: Optional[deque] = None,
-    ) -> None:
+    def __init__(self, config: BacktestConfig, event_queue: deque) -> None:
         self._config      = config
-        self._data        = data_handler
-        self._event_queue = event_queue  # may be injected later by BacktestEngine
+        self._event_queue = event_queue  # may be replaced by BacktestEngine
 
-        pcfg = config.portfolio
-        self._cash         = pcfg.initial_capital
-        self._initial_cap  = pcfg.initial_capital
-        self._positions: Dict[str, Position] = {}
-        self._equity_curve: List[Dict] = []
-        self._trade_log:    List[Dict] = []
+        self.cash             = config.portfolio.initial_capital
+        self.holdings:         Dict[str, dict]         = {}
+        self.equity_curve:     List[tuple]             = []
+        self.trade_log:        List[dict]              = []
+        self._pending_orders:  Dict[str, "OrderEvent"] = {}
 
     # ──────────────────────────────────────────────────────────────────────
-    # PROPERTIES
+    # SIGNAL → ORDER
     # ──────────────────────────────────────────────────────────────────────
 
-    @property
-    def cash(self) -> float:
-        return self._cash
-
-    @property
-    def open_positions(self) -> Dict[str, Position]:
-        return self._positions
-
-    @property
-    def equity(self) -> float:
-        """Total portfolio value: cash + mark-to-market of all open positions."""
-        total = self._cash
-        for sym, pos in self._positions.items():
-            price = self._data.get_current_price(sym)
-            if price is not None:
-                total += pos.market_value(price)
-        return total
-
-    @property
-    def num_open_positions(self) -> int:
-        return len(self._positions)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # SIGNAL PROCESSING → ORDER EMISSION
-    # ──────────────────────────────────────────────────────────────────────
-
-    def process_signal(self, signal: SignalEvent, data_handler: DataHandler) -> None:
+    def process_signal(self, signal_event: SignalEvent, data_handler) -> None:
         """
-        React to a SignalEvent. Compute position size and emit an OrderEvent.
+        Convert a SignalEvent into an OrderEvent after checking risk limits.
 
-        Parameters
-        ----------
-        signal       : SignalEvent from the strategy.
-        data_handler : DataHandler — used for current price and ATR bars.
+        Entry signals (LONG/SHORT):
+          Skipped if already invested, order pending, or max positions reached.
+          Size is computed via _compute_position_size().
+
+        Exit signals (EXIT_LONG/EXIT_SHORT):
+          Immediately emit a SELL/BUY for the full current quantity.
         """
-        symbol    = signal.symbol
-        direction = signal.direction
+        symbol    = signal_event.symbol
+        direction = signal_event.direction
         pcfg      = self._config.portfolio
         scfg      = self._config.strategy
 
         if direction in (SignalDirection.LONG, SignalDirection.SHORT):
             if direction == SignalDirection.SHORT and not scfg.allow_short:
-                logger.debug("SHORT signal ignored for %s — allow_short=False.", symbol)
-                return
-
-            if symbol in self._positions:
-                logger.debug("Signal ignored for %s — position already open.", symbol)
-                return
-
-            if self.num_open_positions >= pcfg.max_open_positions:
-                logger.debug(
-                    "Signal ignored for %s — max open positions (%d) reached.",
-                    symbol, pcfg.max_open_positions,
-                )
+                logger.debug("SHORT ignored for %s — allow_short=False.", symbol)
                 return
 
             price = data_handler.get_current_price(symbol)
-            if price is None or price <= 0:
-                logger.warning("Cannot size position for %s — invalid price.", symbol)
+            if price is None:
+                logger.warning("No price for %s — signal skipped.", symbol)
                 return
 
-            qty = self._compute_quantity(symbol, price, signal, data_handler)
+            if symbol in self.holdings:
+                return  # already invested
+
+            if symbol in self._pending_orders:
+                return  # order already pending fill
+
+            open_slots = len(self.holdings) + len(self._pending_orders)
+            if open_slots >= pcfg.max_open_positions:
+                logger.debug(
+                    "Max positions (%d) reached — skipping %s.",
+                    pcfg.max_open_positions, symbol,
+                )
+                return
+
+            qty = self._compute_position_size(signal_event, data_handler, price)
             if qty <= 0:
-                logger.debug("Position size 0 for %s — skipping order.", symbol)
                 return
 
             order_dir = (
                 OrderDirection.BUY if direction == SignalDirection.LONG
                 else OrderDirection.SELL
             )
-            self._emit_order(signal, order_dir, qty)
+            order = OrderEvent(
+                timestamp=signal_event.timestamp,
+                symbol=symbol,
+                direction=order_dir,
+                quantity=qty,
+                signal_ref=signal_event,
+            )
+            self._event_queue.append(order)
+            self._pending_orders[symbol] = order
 
         elif direction == SignalDirection.EXIT_LONG:
-            if symbol not in self._positions:
+            if symbol not in self.holdings:
                 return
-            qty = self._positions[symbol].quantity
-            self._emit_order(signal, OrderDirection.SELL, qty)
+            qty   = self.holdings[symbol]["quantity"]
+            order = OrderEvent(
+                timestamp=signal_event.timestamp,
+                symbol=symbol,
+                direction=OrderDirection.SELL,
+                quantity=qty,
+                signal_ref=signal_event,
+            )
+            self._event_queue.append(order)
 
         elif direction == SignalDirection.EXIT_SHORT:
-            if symbol not in self._positions:
+            if symbol not in self.holdings:
                 return
-            qty = self._positions[symbol].quantity
-            self._emit_order(signal, OrderDirection.BUY, qty)
-
-    def update_portfolio_on_fill(self, fill: FillEvent) -> None:
-        """
-        React to a FillEvent: update cash and holdings.
-
-        Parameters
-        ----------
-        fill : FillEvent emitted by ExecutionHandler.
-        """
-        symbol     = fill.symbol
-        qty        = fill.quantity
-        price      = fill.fill_price
-        commission = fill.commission
-        direction  = fill.direction
-
-        if direction == OrderDirection.BUY:
-            cost = qty * price + commission
-            if cost > self._cash:
-                logger.warning(
-                    "Insufficient cash for fill: need %.2f, have %.2f.",
-                    cost, self._cash,
-                )
-            self._cash -= cost
-
-            if symbol in self._positions:
-                pos = self._positions[symbol]
-                total_qty = pos.quantity + qty
-                avg_cost  = (pos.quantity * pos.avg_cost + qty * price) / total_qty
-                pos.quantity = total_qty
-                pos.avg_cost = avg_cost
-            else:
-                strategy_id = ""
-                if fill.order_ref and fill.order_ref.signal_ref:
-                    strategy_id = fill.order_ref.signal_ref.strategy_id
-                self._positions[symbol] = Position(
-                    symbol=symbol,
-                    quantity=qty,
-                    avg_cost=price,
-                    entry_date=fill.timestamp,
-                    strategy_id=strategy_id,
-                )
-
-            self._log_trade(fill, "ENTRY")
-
-        elif direction == OrderDirection.SELL:
-            pos = self._positions.get(symbol)
-            proceeds = qty * price - commission
-            self._cash += proceeds
-
-            realised_pnl = 0.0
-            if pos is not None:
-                realised_pnl = qty * (price - pos.avg_cost) - commission
-                remaining = pos.quantity - qty
-                if remaining <= 0:
-                    del self._positions[symbol]
-                else:
-                    pos.quantity = remaining
-
-            self._log_trade(fill, "EXIT", realised_pnl=realised_pnl)
-
-    def update_equity_curve(self, timestamp: datetime) -> None:
-        """Snapshot portfolio value at end of each bar."""
-        self._equity_curve.append({
-            "date":           timestamp,
-            "equity":         self.equity,
-            "cash":           self._cash,
-            "open_positions": self.num_open_positions,
-        })
-
-    # ──────────────────────────────────────────────────────────────────────
-    # RESULT ACCESSORS
-    # ──────────────────────────────────────────────────────────────────────
-
-    def calculate_equity_curve(self) -> pd.Series:
-        """
-        Return the full equity curve as a pd.Series (date → equity value).
-        Called by BacktestEngine._finalise() after the main loop.
-        """
-        if not self._equity_curve:
-            return pd.Series(dtype=float)
-        df = pd.DataFrame(self._equity_curve)
-        df["date"] = pd.to_datetime(df["date"])
-        return df.set_index("date")["equity"]
-
-    def get_equity_curve(self) -> pd.DataFrame:
-        """Return the full equity curve as a DataFrame (includes cash + positions columns)."""
-        if not self._equity_curve:
-            return pd.DataFrame()
-        df = pd.DataFrame(self._equity_curve)
-        df["date"] = pd.to_datetime(df["date"])
-        return df.set_index("date")
-
-    def get_trade_log(self) -> pd.DataFrame:
-        """Return the full trade log as a DataFrame."""
-        if not self._trade_log:
-            return pd.DataFrame()
-        return pd.DataFrame(self._trade_log)
-
-    def get_final_equity(self) -> float:
-        """Return the most recently snapshotted equity value."""
-        if self._equity_curve:
-            return self._equity_curve[-1]["equity"]
-        return self.equity
-
-    def mark_to_market_final(self) -> float:
-        """
-        Compute total value including unrealised PnL on all open positions.
-        Used by _finalise() for the closing mark-to-market step.
-        Returns total equity at last available prices.
-        """
-        return self.equity  # equity property already does this
+            qty   = self.holdings[symbol]["quantity"]
+            order = OrderEvent(
+                timestamp=signal_event.timestamp,
+                symbol=symbol,
+                direction=OrderDirection.BUY,
+                quantity=qty,
+                signal_ref=signal_event,
+            )
+            self._event_queue.append(order)
 
     # ──────────────────────────────────────────────────────────────────────
     # POSITION SIZING
     # ──────────────────────────────────────────────────────────────────────
 
-    def _compute_quantity(
+    def _compute_position_size(
         self,
-        symbol: str,
-        price: float,
         signal: SignalEvent,
-        data_handler: DataHandler,
+        data_handler,
+        current_price: float,
     ) -> int:
-        """Compute integer share quantity using the configured sizing method."""
+        """
+        Determine share quantity based on the configured sizing method.
+
+        Returns 0 if any constraint is violated (no trade).
+        """
         pcfg   = self._config.portfolio
         scfg   = self._config.strategy
         method = pcfg.sizing_method
-        equity = self.equity
-
-        # Exposure guard: don't exceed the total exposure budget
-        current_exposure = equity - self._cash
-        max_new_exposure = equity * pcfg.max_total_exposure_pct - current_exposure
-        if max_new_exposure <= 0:
-            return 0
 
         if method == "fixed":
             qty = pcfg.fixed_quantity
+            if qty * current_price > self.cash:
+                return 0
+            return qty
 
-        elif method == "equal_weight":
-            allocation = equity / max(1, pcfg.max_open_positions)
-            qty        = int(allocation / price)
+        total = self.cash + self._mark_to_market_value(data_handler)
+
+        if method == "equal_weight":
+            per_position = total * pcfg.max_position_pct
+            qty          = int(per_position / current_price)
 
         elif method == "atr":
-            qty = self._atr_size(symbol, price, equity, scfg, pcfg, data_handler)
-
+            qty = self._atr_quantity(signal.symbol, data_handler, total, current_price)
         else:
             logger.warning("Unknown sizing_method '%s' — using equal_weight.", method)
-            allocation = equity / max(1, pcfg.max_open_positions)
-            qty        = int(allocation / price)
+            per_position = total * pcfg.max_position_pct
+            qty          = int(per_position / current_price)
 
-        # Per-position cap
-        max_qty_by_cap      = int(equity * pcfg.max_position_pct / price)
-        max_qty_by_exposure = int(max_new_exposure / price)
-        qty = min(qty, max_qty_by_cap, max_qty_by_exposure)
-        return max(0, qty)
+        # ── Constraints ───────────────────────────────────────────────────
+        # Max position cap
+        max_by_cap = int((total * pcfg.max_position_pct) / current_price)
+        qty        = min(qty, max_by_cap)
 
-    def _atr_size(
-        self,
-        symbol: str,
-        price: float,
-        equity: float,
-        scfg,
-        pcfg,
-        data_handler: DataHandler,
+        # Total exposure cap
+        cost_available = (total * pcfg.max_total_exposure_pct) - self._total_invested(data_handler)
+        max_by_exposure = int(cost_available / current_price)
+        qty             = min(qty, max_by_exposure)
+
+        if qty <= 0:
+            return 0
+
+        # Cash sufficiency
+        if qty * current_price > self.cash:
+            return 0
+
+        return qty
+
+    def _atr_quantity(
+        self, symbol: str, data_handler, total: float, price: float
     ) -> int:
         """
-        ATR-based position sizing:
-          risk_amount   = equity × risk_per_trade_pct
-          stop_distance = ATR × atr_stop_multiplier
-          qty           = risk_amount / stop_distance
+        ATR-based sizing:
+          risk_amount = total × risk_per_trade_pct
+          stop        = ATR × atr_stop_multiplier
+          qty         = risk_amount / stop
         Falls back to equal-weight if ATR is unavailable.
         """
-        bars = data_handler.get_latest_bars(symbol, scfg.atr_period + 1)
-        if bars is None or len(bars) < scfg.atr_period + 1:
-            allocation = equity / max(1, pcfg.max_open_positions)
-            return int(allocation / price)
+        scfg  = self._config.strategy
+        pcfg  = self._config.portfolio
+        bars  = data_handler.get_latest_bars(symbol, 20)
 
-        has_hl = data_handler.has_high_low.get(symbol, False)
-        if has_hl:
-            from engine.strategy import atr as compute_atr
-            atr_series = compute_atr(bars["high"], bars["low"], bars["close"], scfg.atr_period)
-            atr_val    = atr_series.iloc[-1]
-        else:
-            atr_val = price * 0.02  # 2% price proxy
+        atr_val = None
+        if bars is not None and len(bars) >= scfg.atr_period + 1:
+            has_hl = data_handler.has_high_low.get(symbol, False)
+            if has_hl:
+                from engine.strategy import atr as compute_atr
+                atr_series = compute_atr(
+                    bars["high"], bars["low"], bars["close"], scfg.atr_period
+                )
+                last = atr_series.iloc[-1]
+                if not np.isnan(last) and last > 0:
+                    atr_val = float(last)
 
-        if np.isnan(atr_val) or atr_val <= 0:
-            allocation = equity / max(1, pcfg.max_open_positions)
-            return int(allocation / price)
+        if atr_val is None:
+            # Equal-weight fallback
+            return int((total * pcfg.max_position_pct) / price)
 
-        risk_amount   = equity * pcfg.risk_per_trade_pct
+        risk_amount   = total * pcfg.risk_per_trade_pct
         stop_distance = atr_val * scfg.atr_stop_multiplier
         return int(risk_amount / stop_distance)
 
     # ──────────────────────────────────────────────────────────────────────
-    # PRIVATE HELPERS
+    # FILL → UPDATE HOLDINGS
     # ──────────────────────────────────────────────────────────────────────
 
-    def _emit_order(
-        self, signal: SignalEvent, direction: OrderDirection, quantity: int
-    ) -> None:
-        order = OrderEvent(
-            timestamp=signal.timestamp,
-            symbol=signal.symbol,
-            direction=direction,
-            quantity=quantity,
-            signal_ref=signal,
-        )
-        self._event_queue.append(order)
+    def update_portfolio_on_fill(self, fill_event: FillEvent) -> None:
+        """
+        Update cash, holdings, and trade log after a fill is received.
+        """
+        symbol     = fill_event.symbol
+        qty        = fill_event.quantity
+        price      = fill_event.fill_price
+        commission = fill_event.commission
+        direction  = fill_event.direction
 
-    def _log_trade(
-        self, fill: FillEvent, trade_type: str, realised_pnl: float = 0.0
-    ) -> None:
-        strategy_id = ""
-        if fill.order_ref and fill.order_ref.signal_ref:
-            strategy_id = fill.order_ref.signal_ref.strategy_id
+        if direction == OrderDirection.BUY:
+            trade_cost = qty * price + commission
+            self.cash -= trade_cost
 
-        self._trade_log.append({
-            "date":         fill.timestamp,
-            "symbol":       fill.symbol,
-            "type":         trade_type,
-            "direction":    fill.direction.value,
-            "quantity":     fill.quantity,
-            "fill_price":   fill.fill_price,
-            "commission":   fill.commission,
-            "slippage":     fill.slippage,
-            "realised_pnl": realised_pnl,
-            "strategy_id":  strategy_id,
-            "equity_after": self.equity,
-        })
+            # Remove from pending
+            self._pending_orders.pop(symbol, None)
+
+            if symbol not in self.holdings:
+                strategy_id = ""
+                if fill_event.order_ref and fill_event.order_ref.signal_ref:
+                    strategy_id = fill_event.order_ref.signal_ref.strategy_id
+                self.holdings[symbol] = {
+                    "quantity":    qty,
+                    "avg_cost":    price,
+                    "entry_date":  fill_event.timestamp,
+                    "entry_price": price,
+                    "strategy_id": strategy_id,
+                }
+            else:
+                # Averaging up (rare but handled gracefully)
+                pos       = self.holdings[symbol]
+                total_qty = pos["quantity"] + qty
+                avg_cost  = (pos["quantity"] * pos["avg_cost"] + qty * price) / total_qty
+                pos["quantity"] = total_qty
+                pos["avg_cost"] = avg_cost
+
+        elif direction == OrderDirection.SELL:
+            self._pending_orders.pop(symbol, None)
+
+            if symbol not in self.holdings:
+                logger.warning("SELL fill for %s but no open position — ignored.", symbol)
+                return
+
+            pos   = self.holdings.pop(symbol)
+            proceeds = qty * price - commission
+            self.cash += proceeds
+
+            gross_pnl  = (price - pos["avg_cost"]) * qty
+            net_pnl    = gross_pnl - commission
+            cost_basis = pos["avg_cost"] * pos["quantity"]
+            return_pct = net_pnl / cost_basis if cost_basis != 0 else 0.0
+
+            self.trade_log.append({
+                "symbol":       symbol,
+                "entry_date":   pos["entry_date"],
+                "exit_date":    fill_event.timestamp,
+                "direction":    "LONG",
+                "quantity":     qty,
+                "entry_price":  pos["entry_price"],
+                "exit_price":   price,
+                "gross_pnl":    round(gross_pnl, 4),
+                "commission":   round(commission, 4),
+                "net_pnl":      round(net_pnl, 4),
+                "strategy_id":  pos.get("strategy_id", ""),
+                "return_pct":   round(return_pct, 6),
+            })
+
+    # ──────────────────────────────────────────────────────────────────────
+    # EQUITY SNAPSHOT
+    # ──────────────────────────────────────────────────────────────────────
+
+    def record_equity(self, timestamp: datetime, data_handler) -> None:
+        """
+        Record the current portfolio value at this timestamp.
+        Called at the end of each bar by BacktestEngine.
+        """
+        total = self.cash + self._mark_to_market_value(data_handler)
+        self.equity_curve.append((timestamp, total))
+
+    def _mark_to_market_value(self, data_handler) -> float:
+        """Total current market value of all open positions."""
+        total = 0.0
+        for symbol, pos in self.holdings.items():
+            price = data_handler.get_current_price(symbol)
+            if price is not None:
+                total += pos["quantity"] * price
+            else:
+                total += pos["quantity"] * pos["avg_cost"]
+        return total
+
+    def _total_invested(self, data_handler) -> float:
+        """Mark-to-market value invested (alias for exposure calculation)."""
+        return self._mark_to_market_value(data_handler)
+
+    def get_total_equity(self, data_handler) -> float:
+        """Return cash + mark-to-market of all open positions."""
+        return self.cash + self._mark_to_market_value(data_handler)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # REPORTING ACCESSORS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def calculate_equity_curve(self) -> pd.Series:
+        """Convert the equity_curve list into a pd.Series indexed by datetime."""
+        if not self.equity_curve:
+            return pd.Series(dtype=float, name="portfolio_value")
+        dates, values = zip(*self.equity_curve)
+        return pd.Series(values, index=pd.DatetimeIndex(dates), name="portfolio_value")
+
+    def get_trade_log(self) -> List[dict]:
+        """Return the complete trade log as a list of dicts."""
+        return list(self.trade_log)
+
+    def get_open_positions(self) -> Dict[str, dict]:
+        """Return a copy of all currently open positions."""
+        return {sym: dict(pos) for sym, pos in self.holdings.items()}
+
+    def get_portfolio_summary(self, data_handler) -> dict:
+        """Return a human-readable snapshot of the current portfolio state."""
+        invested  = self._mark_to_market_value(data_handler)
+        positions = {}
+        for sym, pos in self.holdings.items():
+            price = data_handler.get_current_price(sym) or pos["avg_cost"]
+            positions[sym] = {
+                **pos,
+                "current_price": price,
+                "market_value":  pos["quantity"] * price,
+                "unrealised_pnl": (price - pos["avg_cost"]) * pos["quantity"],
+            }
+        return {
+            "cash":           self.cash,
+            "invested_value": invested,
+            "total_equity":   self.cash + invested,
+            "num_positions":  len(self.holdings),
+            "open_positions": positions,
+            "total_trades":   len(self.trade_log),
+        }
+
+    def get_final_equity(self) -> float:
+        """Return the last snapshotted portfolio value."""
+        if self.equity_curve:
+            return self.equity_curve[-1][1]
+        return self.cash

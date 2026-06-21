@@ -1,11 +1,6 @@
 # reports/generator.py
 # ============================================================
-# HTML REPORT BUILDER
-# Assembles a self-contained HTML report from:
-#   - Performance metrics table
-#   - Embedded plotly interactive chart
-#   - Trade log table
-#   - Monthly returns heatmap (base64-encoded PNG)
+# GENERATES HTML REPORTS, CSV EXPORTS, AND CONSOLE SUMMARIES
 # ============================================================
 
 import base64
@@ -13,389 +8,539 @@ import io
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
+from performance.metrics import PerformanceMetrics
+from reports.charts import (
+    plot_equity_curve,
+    plot_drawdown,
+    plot_monthly_returns_heatmap,
+    plot_trade_distribution,
+    plot_rolling_sharpe,
+    plot_walk_forward_results,
+    plotly_combined_dashboard,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _metric_fmt(key: str, val: float) -> str:
-    """Format a metric value for display."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "N/A"
-    pct_keys = {
-        "total_return", "cagr", "annualised_volatility",
-        "max_drawdown", "var_95", "cvar_95", "alpha",
-        "benchmark_return", "win_rate",
-    }
-    ratio_keys = {
-        "sharpe_ratio", "sortino_ratio", "calmar_ratio",
-        "profit_factor", "beta", "information_ratio",
-    }
-    if key in pct_keys:
-        return f"{val * 100:.2f}%"
-    elif key in ratio_keys:
-        return f"{val:.3f}"
-    elif key == "num_trades":
-        return f"{int(val)}"
-    elif key == "max_dd_duration_days":
-        return f"{int(val)} days"
-    elif key in ("avg_trade_pnl", "expectancy"):
-        return f"₹{val:,.0f}"
-    return f"{val:.4f}"
-
-
-def _fig_to_base64_png(fig) -> str:
-    """Convert a matplotlib figure to a base64-encoded PNG string."""
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    buf.seek(0)
-    encoded = base64.b64encode(buf.read()).decode("utf-8")
-    buf.close()
-    return encoded
-
-
-def _plotly_to_html_div(fig) -> str:
-    """Render a plotly figure as an HTML div (no full page wrapper)."""
-    try:
-        return fig.to_html(full_html=False, include_plotlyjs="cdn")
-    except Exception as e:
-        logger.warning("Could not render plotly figure: %s", e)
-        return "<p><em>Interactive chart unavailable.</em></p>"
-
-
-_HTML_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{title}</title>
-  <style>
-    :root {{
-      --bg: #0f1117;
-      --surface: #1a1d27;
-      --border: #2d3148;
-      --text: #e8eaf6;
-      --muted: #9fa8da;
-      --green: #4caf50;
-      --red: #ef5350;
-      --accent: #5c6bc0;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; padding: 24px; }}
-    h1 {{ font-size: 1.8rem; color: var(--accent); margin-bottom: 4px; }}
-    h2 {{ font-size: 1.15rem; color: var(--muted); margin: 28px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
-    .meta {{ font-size: 0.85rem; color: var(--muted); margin-bottom: 24px; }}
-    .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }}
-    .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; }}
-    .metric-label {{ font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }}
-    .metric-value {{ font-size: 1.4rem; font-weight: 600; margin-top: 4px; }}
-    .positive {{ color: var(--green); }}
-    .negative {{ color: var(--red); }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
-    th {{ background: var(--surface); color: var(--muted); padding: 8px 12px; text-align: left; font-weight: 500; border-bottom: 2px solid var(--border); }}
-    td {{ padding: 7px 12px; border-bottom: 1px solid var(--border); }}
-    tr:hover td {{ background: #1e2135; }}
-    .chart-container {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 24px; }}
-    img.chart {{ max-width: 100%; border-radius: 6px; }}
-    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }}
-    .badge-green {{ background: rgba(76,175,80,0.15); color: var(--green); }}
-    .badge-red   {{ background: rgba(239,83,80,0.15); color: var(--red); }}
-    footer {{ margin-top: 40px; font-size: 0.75rem; color: var(--muted); text-align: center; }}
-  </style>
-</head>
-<body>
-  <h1>{title}</h1>
-  <p class="meta">Generated: {generated_at} &nbsp;|&nbsp; Strategy: {strategy_id} &nbsp;|&nbsp; Period: {period}</p>
-
-  <h2>Key Metrics</h2>
-  <div class="grid-2">
-    {metric_cards}
-  </div>
-
-  <h2>Interactive Equity Curve</h2>
-  <div class="chart-container">
-    {plotly_div}
-  </div>
-
-  {monthly_heatmap_section}
-
-  <h2>Full Metrics</h2>
-  <div class="card">
-    {metrics_table}
-  </div>
-
-  <h2>Trade Log</h2>
-  <div class="card" style="overflow-x:auto">
-    {trade_table}
-  </div>
-
-  <footer>
-    Backtester &mdash; for research purposes only. Not financial advice.
-  </footer>
-</body>
-</html>
-"""
-
-
-def _make_metric_card(label: str, raw_key: str, val: float) -> str:
-    formatted = _metric_fmt(raw_key, val)
-    is_pos    = val >= 0 if (isinstance(val, float) and not np.isnan(val)) else True
-    css       = "positive" if is_pos else "negative"
-    return (
-        f'<div class="card">'
-        f'<div class="metric-label">{label}</div>'
-        f'<div class="metric-value {css}">{formatted}</div>'
-        f'</div>'
-    )
-
-
-def _metrics_table_html(metrics: Dict[str, float]) -> str:
-    rows = ""
-    for key, val in metrics.items():
-        label = key.replace("_", " ").title()
-        fmt   = _metric_fmt(key, val)
-        if isinstance(val, float) and not np.isnan(val):
-            css = "positive" if val >= 0 else "negative"
-        else:
-            css = ""
-        rows += f"<tr><td>{label}</td><td class='{css}'><strong>{fmt}</strong></td></tr>"
-    return f"<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>{rows}</tbody></table>"
-
-
-def _trade_table_html(trade_log: pd.DataFrame, max_rows: int = 200) -> str:
-    if trade_log is None or trade_log.empty:
-        return "<p><em>No trades recorded.</em></p>"
-
-    df = trade_log.head(max_rows).copy()
-    for col in ("fill_price", "commission", "slippage"):
-        if col in df.columns:
-            df[col] = df[col].map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "")
-    if "realised_pnl" in df.columns:
-        def _pnl(x):
-            if pd.isna(x) or x == 0:
-                return ""
-            badge = "badge-green" if x > 0 else "badge-red"
-            return f'<span class="badge {badge}">₹{x:,.0f}</span>'
-        df["realised_pnl"] = df["realised_pnl"].map(_pnl)
-
-    # Date formatting
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-
-    cols_order = [
-        c for c in ["date","symbol","type","direction","quantity",
-                     "fill_price","commission","realised_pnl","strategy_id"]
-        if c in df.columns
-    ]
-    df = df[cols_order]
-
-    header = "".join(f"<th>{c.replace('_',' ').title()}</th>" for c in df.columns)
-    body   = ""
-    for _, row in df.iterrows():
-        body += "<tr>" + "".join(f"<td>{v}</td>" for v in row.values) + "</tr>"
-
-    if len(trade_log) > max_rows:
-        note = f"<p><em>Showing first {max_rows} of {len(trade_log)} trades.</em></p>"
-    else:
-        note = ""
-
-    return f"{note}<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
-
-
 class ReportGenerator:
     """
-    Builds and saves a self-contained HTML performance report.
+    Orchestrates the creation of all output files from a completed backtest.
 
-    Usage
-    -----
-    gen = ReportGenerator(config)
-    gen.generate(
-        equity=equity_series,
-        trade_log=trade_df,
-        metrics=metrics_dict,
-        strategy_id="DualMA_SMA_20_50",
-        benchmark_equity=bench_series,   # optional
-    )
+    Output files
+    ------------
+    output/reports/{run_id}_report.html      — Full standalone HTML report
+    output/reports/{run_id}_dashboard.html   — Interactive Plotly dashboard
+    output/charts/{run_id}_equity.png        — Equity curve PNG
+    output/charts/{run_id}_drawdown.png      — Drawdown PNG
+    output/charts/{run_id}_monthly.png       — Monthly heatmap PNG
+    output/charts/{run_id}_trades.png        — Trade distribution PNG
+    output/charts/{run_id}_rolling_sharpe.png
+    output/logs/{run_id}_trades.csv          — Trade log CSV
+    output/logs/{run_id}_equity.csv          — Equity curve CSV
+    output/logs/{run_id}_metrics.csv         — Metrics summary CSV
     """
 
     def __init__(self, config: BacktestConfig) -> None:
         self._config = config
+        out          = config.report.output_dir
 
-    def generate(
+        self._dirs = {
+            "reports": os.path.join(out, "reports"),
+            "charts":  os.path.join(out, "charts"),
+            "logs":    os.path.join(out, "logs"),
+        }
+        for d in self._dirs.values():
+            os.makedirs(d, exist_ok=True)
+
+        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = ts  # overridden in generate_all with strategy name
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PUBLIC ENTRY POINT
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_all(
         self,
-        equity: pd.Series,
-        trade_log: pd.DataFrame,
-        metrics: Dict[str, float],
-        strategy_id: str,
-        benchmark_equity: Optional[pd.Series] = None,
-        filename: Optional[str] = None,
+        equity_curve: pd.Series,
+        trade_log: List[dict],
+        metrics: dict,
+        benchmark_curve: Optional[pd.Series] = None,
+        wf_results: Optional[List[dict]] = None,
+        strategy_name: str = "Strategy",
     ) -> str:
         """
-        Build the HTML report and write it to disk.
-
-        Parameters
-        ----------
-        equity           : pd.Series — portfolio equity curve.
-        trade_log        : pd.DataFrame — trade log from PortfolioManager.
-        metrics          : dict — output of compute_all_metrics().
-        strategy_id      : str — displayed in the report header.
-        benchmark_equity : pd.Series or None.
-        filename         : str or None — output filename (without directory).
-                           Defaults to "{strategy_id}_{date}.html".
-
-        Returns
-        -------
-        str — path to the saved HTML file.
+        Generate every output file and return the path to the main HTML report.
         """
-        rcfg     = self._config.report
-        out_dir  = os.path.join(rcfg.output_dir, "reports")
-        os.makedirs(out_dir, exist_ok=True)
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = f"{strategy_name.replace(' ', '_')}_{ts}"
 
-        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if filename is None:
-            safe_sid  = strategy_id.replace("/", "_").replace(" ", "_")
-            filename  = f"{safe_sid}_{timestamp}.html"
-        out_path = os.path.join(out_dir, filename)
+        perf            = PerformanceMetrics(self._config)
+        monthly_returns = perf.calculate_monthly_returns(equity_curve)
+        rolling_sharpe  = perf.calculate_rolling_sharpe(equity_curve)
 
-        # ── Build interactive plotly chart ───────────────────────────────
-        plotly_div = "<p><em>Plotly not available.</em></p>"
-        try:
-            from reports.charts import interactive_equity_chart
-            plotly_fig = interactive_equity_chart(
-                equity, benchmark_equity, trade_log, strategy_id
-            )
-            plotly_div = _plotly_to_html_div(plotly_fig)
-        except Exception as e:
-            logger.warning("Could not build interactive chart: %s", e)
+        chart_paths: dict = {}
 
-        # ── Build monthly heatmap PNG (embedded) ──────────────────────────
-        monthly_heatmap_section = ""
-        if rcfg.save_charts_png and len(equity) > 30:
+        # ── Matplotlib PNGs ───────────────────────────────────────────────
+        if self._config.report.save_charts_png:
+            chart_specs = [
+                ("equity",         lambda: plot_equity_curve(equity_curve, benchmark_curve, self._config)),
+                ("drawdown",       lambda: plot_drawdown(equity_curve, self._config)),
+                ("monthly",        lambda: plot_monthly_returns_heatmap(monthly_returns, self._config)),
+                ("trades",         lambda: plot_trade_distribution(trade_log, self._config)),
+                ("rolling_sharpe", lambda: plot_rolling_sharpe(rolling_sharpe, self._config)),
+            ]
+            for name, fn in chart_specs:
+                path = os.path.join(self._dirs["charts"], f"{self.run_id}_{name}.png")
+                try:
+                    fig = fn()
+                    fig.savefig(path, dpi=120, bbox_inches="tight")
+                    fig.clf()
+                    import matplotlib.pyplot as plt
+                    plt.close("all")
+                    chart_paths[name] = path
+                    logger.debug("Chart saved: %s", path)
+                except Exception as exc:
+                    logger.warning("Failed to generate chart '%s': %s", name, exc)
+
+        # ── Walk-forward chart ────────────────────────────────────────────
+        if wf_results:
+            wf_engine = _build_wf_report_df(wf_results)
             try:
-                from reports.charts import monthly_returns_heatmap
-                hm_fig   = monthly_returns_heatmap(equity, rcfg.chart_style)
-                b64      = _fig_to_base64_png(hm_fig)
-                monthly_heatmap_section = (
-                    f'<h2>Monthly Returns Heatmap</h2>'
-                    f'<div class="chart-container">'
-                    f'<img class="chart" src="data:image/png;base64,{b64}" alt="Monthly Returns" />'
-                    f'</div>'
-                )
+                path = os.path.join(self._dirs["charts"], f"{self.run_id}_walkforward.png")
+                fig  = plot_walk_forward_results(wf_engine, self._config)
+                fig.savefig(path, dpi=120, bbox_inches="tight")
                 import matplotlib.pyplot as plt
-                plt.close(hm_fig)
-            except Exception as e:
-                logger.warning("Could not build monthly heatmap: %s", e)
+                plt.close("all")
+                chart_paths["walkforward"] = path
+            except Exception as exc:
+                logger.warning("Walk-forward chart failed: %s", exc)
 
-        # ── Key metric cards ─────────────────────────────────────────────
-        highlight = [
-            ("Total Return",  "total_return"),
-            ("CAGR",          "cagr"),
-            ("Sharpe Ratio",  "sharpe_ratio"),
-            ("Max Drawdown",  "max_drawdown"),
-            ("Sortino Ratio", "sortino_ratio"),
-            ("Win Rate",      "win_rate"),
-        ]
-        cards_html = "".join(
-            _make_metric_card(label, key, metrics.get(key, np.nan))
-            for label, key in highlight
-        )
-
-        # ── Period string ─────────────────────────────────────────────────
-        period = (
-            f"{self._config.data.start_date} → {self._config.data.end_date}"
-        )
-
-        html = _HTML_TEMPLATE.format(
-            title              = f"Backtest Report — {strategy_id}",
-            generated_at       = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            strategy_id        = strategy_id,
-            period             = period,
-            metric_cards       = cards_html,
-            plotly_div         = plotly_div,
-            monthly_heatmap_section = monthly_heatmap_section,
-            metrics_table      = _metrics_table_html(metrics),
-            trade_table        = _trade_table_html(trade_log),
-        )
-
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html)
-
-        logger.info("HTML report saved → %s", out_path)
-        if self._config.verbose:
-            print(f"[Report] Saved → {out_path}")
-
-        return out_path
-
-    def save_csv_artifacts(
-        self,
-        equity: pd.Series,
-        trade_log: pd.DataFrame,
-        strategy_id: str,
-    ) -> None:
-        """Save equity curve and trade log as CSV files."""
-        rcfg    = self._config.report
-        out_dir = rcfg.output_dir
-        os.makedirs(out_dir, exist_ok=True)
-
-        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_id = strategy_id.replace("/", "_").replace(" ", "_")
-
-        if rcfg.save_equity_curve_csv and not equity.empty:
-            path = os.path.join(out_dir, f"{safe_id}_equity_{ts}.csv")
-            equity.to_csv(path, header=True)
-            logger.info("Equity curve saved → %s", path)
-
-        if rcfg.save_csv_trades and not trade_log.empty:
-            path = os.path.join(out_dir, f"{safe_id}_trades_{ts}.csv")
-            trade_log.to_csv(path, index=False)
-            logger.info("Trade log saved → %s", path)
-
-    def save_static_charts(
-        self,
-        equity: pd.Series,
-        trade_log: pd.DataFrame,
-        strategy_id: str,
-        benchmark_equity: Optional[pd.Series] = None,
-    ) -> None:
-        """Save static PNG chart files to output/charts/."""
-        rcfg    = self._config.report
-        if not rcfg.save_charts_png:
-            return
-
-        charts_dir = os.path.join(rcfg.output_dir, "charts")
-        os.makedirs(charts_dir, exist_ok=True)
-        safe_id = strategy_id.replace("/", "_").replace(" ", "_")
-        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+        # ── Plotly dashboard HTML ─────────────────────────────────────────
+        dash_path = os.path.join(self._dirs["reports"], f"{self.run_id}_dashboard.html")
         try:
-            import matplotlib.pyplot as plt
-            from reports.charts import equity_curve_chart, trade_analysis_chart, monthly_returns_heatmap
-
-            fig = equity_curve_chart(
-                equity, benchmark_equity, strategy_id, rcfg.chart_style,
-                save_path=os.path.join(charts_dir, f"{safe_id}_equity_{ts}.png"),
+            fig_dash = plotly_combined_dashboard(
+                equity_curve, benchmark_curve, trade_log, metrics, monthly_returns
             )
-            plt.close(fig)
+            fig_dash.write_html(dash_path, include_plotlyjs="cdn")
+            logger.info("Dashboard saved: %s", dash_path)
+        except Exception as exc:
+            logger.warning("Plotly dashboard failed: %s", exc)
 
-            if not trade_log.empty:
-                fig = trade_analysis_chart(
-                    trade_log, rcfg.chart_style,
-                    save_path=os.path.join(charts_dir, f"{safe_id}_trades_{ts}.png"),
-                )
-                if fig:
-                    plt.close(fig)
+        # ── Full HTML report ──────────────────────────────────────────────
+        html     = self._build_html_report(
+            equity_curve, trade_log, metrics, monthly_returns,
+            benchmark_curve, wf_results, strategy_name, chart_paths,
+        )
+        rep_path = os.path.join(self._dirs["reports"], f"{self.run_id}_report.html")
+        with open(rep_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        logger.info("HTML report saved: %s", rep_path)
 
-            fig = monthly_returns_heatmap(
-                equity, rcfg.chart_style,
-                save_path=os.path.join(charts_dir, f"{safe_id}_monthly_{ts}.png"),
+        # ── CSV exports ───────────────────────────────────────────────────
+        if self._config.report.save_csv_trades:
+            csv_path = os.path.join(self._dirs["logs"], f"{self.run_id}_trades.csv")
+            self.save_trades_csv(trade_log, csv_path)
+
+        if self._config.report.save_equity_curve_csv:
+            csv_path = os.path.join(self._dirs["logs"], f"{self.run_id}_equity.csv")
+            self.save_equity_csv(equity_curve, csv_path)
+
+        metrics_path = os.path.join(self._dirs["logs"], f"{self.run_id}_metrics.csv")
+        self.save_metrics_csv(metrics, metrics_path)
+
+        self._print_console_summary(metrics, strategy_name)
+
+        return rep_path
+
+    # ──────────────────────────────────────────────────────────────────────
+    # HTML REPORT BUILDER
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_html_report(
+        self,
+        equity_curve: pd.Series,
+        trade_log: List[dict],
+        metrics: dict,
+        monthly_returns: pd.DataFrame,
+        benchmark_curve: Optional[pd.Series],
+        wf_results: Optional[List[dict]],
+        strategy_name: str,
+        chart_paths: dict,
+    ) -> str:
+        """Build a fully self-contained HTML report (base64-embedded images)."""
+
+        def _b64(path: str) -> str:
+            try:
+                with open(path, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
+            except Exception:
+                return ""
+
+        def _img(key: str) -> str:
+            if key not in chart_paths:
+                return ""
+            b64 = _b64(chart_paths[key])
+            if not b64:
+                return ""
+            return f'<img src="data:image/png;base64,{b64}" class="chart-img">'
+
+        def _fmt(val, fmt_str: str = ".2%", fallback: str = "N/A") -> str:
+            if val is None:
+                return fallback
+            try:
+                return format(val, fmt_str)
+            except Exception:
+                return str(val)
+
+        # ── Metric tiles ──────────────────────────────────────────────────
+        tiles_html = _metric_tiles(metrics)
+
+        # ── Metrics table ─────────────────────────────────────────────────
+        table_rows = ""
+        labels = {
+            "total_return_pct":   ("Total Return",        ".2%"),
+            "cagr":               ("CAGR",                ".2%"),
+            "sharpe_ratio":       ("Sharpe Ratio",        ".3f"),
+            "sortino_ratio":      ("Sortino Ratio",       ".3f"),
+            "calmar_ratio":       ("Calmar Ratio",        ".3f"),
+            "max_drawdown_pct":   ("Max Drawdown",        ".2%"),
+            "max_dd_peak_date":   ("Peak Date",           "s"),
+            "max_dd_trough_date": ("Trough Date",         "s"),
+            "total_trades":       ("Total Trades",        ".0f"),
+            "win_rate":           ("Win Rate",            ".2%"),
+            "profit_factor":      ("Profit Factor",       ".3f"),
+            "avg_win_loss_ratio": ("Avg Win/Loss Ratio",  ".3f"),
+            "alpha":              ("Alpha (annual)",      ".2%"),
+            "beta":               ("Beta",               ".3f"),
+            "benchmark_cagr":     ("Benchmark CAGR",     ".2%"),
+            "start_date":         ("Start Date",          "s"),
+            "end_date":           ("End Date",            "s"),
+            "start_capital":      ("Start Capital",      ",.0f"),
+            "end_capital":        ("End Capital",        ",.0f"),
+        }
+        for key, (label, fmt_str) in labels.items():
+            val  = metrics.get(key)
+            disp = _fmt(val, fmt_str)
+            row_class = ""
+            if key in ("total_return_pct", "cagr") and val is not None:
+                row_class = 'class="positive"' if val > 0 else 'class="negative"'
+            table_rows += f"<tr {row_class}><td>{label}</td><td>{disp}</td></tr>\n"
+
+        # ── Trade log table ────────────────────────────────────────────────
+        trade_rows = ""
+        for t in sorted(trade_log, key=lambda x: x.get("entry_date", "")):
+            css = "win-row" if t.get("net_pnl", 0) > 0 else "loss-row"
+            trade_rows += (
+                f"<tr class='{css}'>"
+                f"<td>{t.get('symbol','')}</td>"
+                f"<td>{_ts(t.get('entry_date'))}</td>"
+                f"<td>{_ts(t.get('exit_date'))}</td>"
+                f"<td>{t.get('direction','')}</td>"
+                f"<td>{t.get('quantity','')}</td>"
+                f"<td>{_fmt(t.get('entry_price',0),',.2f')}</td>"
+                f"<td>{_fmt(t.get('exit_price',0),',.2f')}</td>"
+                f"<td>{_fmt(t.get('gross_pnl',0),',.2f')}</td>"
+                f"<td>{_fmt(t.get('commission',0),',.2f')}</td>"
+                f"<td>{_fmt(t.get('net_pnl',0),',.2f')}</td>"
+                f"<td>{_fmt(t.get('return_pct',0),'.2%')}</td>"
+                f"</tr>\n"
             )
-            plt.close(fig)
 
-        except Exception as e:
-            logger.warning("Static chart generation failed: %s", e)
+        # ── Walk-forward section ───────────────────────────────────────────
+        wf_section = ""
+        if wf_results:
+            df    = _build_wf_report_df(wf_results)
+            wf_section = (
+                "<h2>Walk-Forward Validation Results</h2>"
+                + df.to_html(index=False, classes="data-table", border=0)
+            )
+
+        # ── Config section ─────────────────────────────────────────────────
+        cfg = self._config
+        cfg_lines = [
+            f"Initial Capital: ₹{cfg.portfolio.initial_capital:,.0f}",
+            f"Strategy: {strategy_name}",
+            f"Date Range: {cfg.data.start_date} → {cfg.data.end_date}",
+            f"Symbols: {', '.join(cfg.data.symbols)}",
+            f"Fast Window: {cfg.strategy.fast_ma_window} | Slow Window: {cfg.strategy.slow_ma_window}",
+            f"Sizing Method: {cfg.portfolio.sizing_method}",
+            f"Risk Per Trade: {cfg.portfolio.risk_per_trade_pct:.1%}",
+            f"Slippage: {cfg.execution.slippage_pct:.4%}",
+            f"Commission: {cfg.execution.commission_pct:.4%}",
+            f"STT: {cfg.execution.stt_pct:.4%}",
+        ]
+        cfg_html = "<br>".join(cfg_lines)
+
+        run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Backtest Report — {strategy_name}</title>
+  <style>
+    :root {{
+      --primary: #1f77b4; --green: #2ca02c; --red: #d62728;
+      --bg: #f8f9fa; --card-bg: #ffffff; --border: #dee2e6;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body  {{ font-family: "Segoe UI", Arial, sans-serif; background: var(--bg);
+              color: #333; line-height: 1.55; font-size: 14px; }}
+    header {{ background: var(--primary); color: white; padding: 24px 32px; }}
+    header h1 {{ font-size: 1.8rem; font-weight: 700; }}
+    header p  {{ opacity: 0.85; margin-top: 4px; }}
+    main  {{ max-width: 1400px; margin: 0 auto; padding: 28px 24px; }}
+    section {{ margin-bottom: 36px; }}
+    h2    {{ font-size: 1.15rem; font-weight: 600; color: var(--primary);
+             border-bottom: 2px solid var(--border); padding-bottom: 6px;
+             margin-bottom: 16px; }}
+    .tiles {{ display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }}
+    .tile  {{ background: var(--card-bg); border: 1px solid var(--border);
+              border-radius: 8px; padding: 16px 22px; min-width: 160px;
+              box-shadow: 0 1px 4px rgba(0,0,0,.06); text-align: center; flex: 1; }}
+    .tile .label {{ font-size: .8rem; color: #666; text-transform: uppercase;
+                    letter-spacing: .5px; }}
+    .tile .value {{ font-size: 1.6rem; font-weight: 700; margin-top: 4px; }}
+    .tile.good  .value {{ color: var(--green); }}
+    .tile.bad   .value {{ color: var(--red);   }}
+    .tile.neutral .value {{ color: var(--primary); }}
+    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+    table.data-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    table.data-table th {{ background: var(--primary); color: white;
+                           padding: 8px 12px; text-align: left; }}
+    table.data-table td {{ padding: 6px 12px; border-bottom: 1px solid var(--border); }}
+    table.data-table tr:nth-child(even) td {{ background: #f2f6fb; }}
+    .win-row  td {{ background: rgba(44,160,44,0.07)  !important; }}
+    .loss-row td {{ background: rgba(214,39,40,0.07)  !important; }}
+    .positive {{ color: var(--green); }}
+    .negative {{ color: var(--red);   }}
+    .chart-img {{ width: 100%; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
+    details summary {{ cursor: pointer; font-weight: 600; color: var(--primary);
+                       padding: 6px 0; user-select: none; }}
+    .meta {{ font-size: .8rem; color: #888; margin-top: 8px; }}
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📊 Backtest Report — {strategy_name}</h1>
+  <p>
+    Period: {metrics.get('start_date','—')} → {metrics.get('end_date','—')}
+    &nbsp;|&nbsp; Capital: ₹{metrics.get('start_capital',0):,.0f}
+    &nbsp;|&nbsp; Generated: {run_ts}
+  </p>
+</header>
+
+<main>
+
+  <!-- SECTION 1: KEY METRIC TILES -->
+  <section>
+    <h2>Key Performance Metrics</h2>
+    {tiles_html}
+  </section>
+
+  <!-- SECTION 2: DETAILED METRICS TABLE -->
+  <section>
+    <h2>Detailed Metrics</h2>
+    <div class="two-col">
+      <table class="data-table">
+        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- SECTION 3: CHARTS -->
+  <section>
+    <h2>Charts</h2>
+    {_img('equity')}
+    {_img('drawdown')}
+    {_img('monthly')}
+    {_img('trades')}
+    {_img('rolling_sharpe')}
+    {_img('walkforward')}
+  </section>
+
+  <!-- SECTION 4: TRADE LOG -->
+  <section>
+    <h2>Trade Log ({len(trade_log)} completed trades)</h2>
+    <div style="overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Entry Date</th><th>Exit Date</th>
+          <th>Dir</th><th>Qty</th>
+          <th>Entry ₹</th><th>Exit ₹</th>
+          <th>Gross P&amp;L</th><th>Commission</th>
+          <th>Net P&amp;L</th><th>Return %</th>
+        </tr>
+      </thead>
+      <tbody>{trade_rows}</tbody>
+    </table>
+    </div>
+  </section>
+
+  <!-- SECTION 5: WALK-FORWARD -->
+  {wf_section}
+
+  <!-- SECTION 6: CONFIG -->
+  <section>
+    <details>
+      <summary>Configuration</summary>
+      <p style="margin-top:12px; font-size:13px; line-height:2">{cfg_html}</p>
+    </details>
+  </section>
+
+</main>
+</body>
+</html>"""
+        return html
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CONSOLE SUMMARY
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _print_console_summary(self, metrics: dict, strategy_name: str) -> None:
+        """Print a boxed performance summary to stdout."""
+        def pct(v):  return f"{v:.2%}" if v is not None else "N/A"
+        def f3(v):   return f"{v:.3f}" if v is not None else "N/A"
+        def num(v):  return f"{int(v)}" if v is not None else "N/A"
+
+        width = 56
+        line  = "═" * width
+        print(f"\n╔{line}╗")
+        print(f"║{'  BACKTEST RESULTS — ' + strategy_name:^{width}}║")
+        period = (
+            metrics.get("start_date","?")
+            + " → "
+            + metrics.get("end_date","?")
+        )
+        print(f"║{'  Period: ' + period:^{width}}║")
+        print(f"╠{line}╣")
+
+        rows = [
+            ("CAGR",            pct(metrics.get("cagr"))),
+            ("Total Return",    pct(metrics.get("total_return_pct"))),
+            ("Sharpe Ratio",    f3(metrics.get("sharpe_ratio"))),
+            ("Sortino Ratio",   f3(metrics.get("sortino_ratio"))),
+            ("Calmar Ratio",    f3(metrics.get("calmar_ratio"))),
+            ("Max Drawdown",    pct(metrics.get("max_drawdown_pct"))),
+            ("Win Rate",        pct(metrics.get("win_rate"))),
+            ("Profit Factor",   f3(metrics.get("profit_factor"))),
+            ("Total Trades",    num(metrics.get("total_trades"))),
+            ("Alpha (annual)",  pct(metrics.get("alpha"))),
+            ("Beta",            f3(metrics.get("beta"))),
+            ("Benchmark CAGR",  pct(metrics.get("benchmark_cagr"))),
+        ]
+        for label, val in rows:
+            content = f"  {label:<22} {val}"
+            print(f"║{content:<{width}}║")
+
+        print(f"╚{line}╝\n")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CSV EXPORTS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def save_trades_csv(self, trade_log: List[dict], filepath: str) -> None:
+        """Save trade log as CSV, sorted by entry date."""
+        if not trade_log:
+            logger.info("No completed trades — skipping trade CSV.")
+            return
+        df = pd.DataFrame(trade_log)
+        if "entry_date" in df.columns:
+            df = df.sort_values("entry_date")
+        for col in df.select_dtypes(include=["float64"]).columns:
+            df[col] = df[col].round(4)
+        df.to_csv(filepath, index=False)
+        logger.info("Trade log saved: %d trades → %s", len(df), filepath)
+
+    def save_equity_csv(self, equity_curve: pd.Series, filepath: str) -> None:
+        """Save equity curve as CSV with daily_return and cumulative_return columns."""
+        df = equity_curve.reset_index()
+        df.columns = ["date", "portfolio_value"]
+        df["daily_return"]       = equity_curve.pct_change().values
+        df["cumulative_return"]  = equity_curve / equity_curve.iloc[0] - 1
+        df.to_csv(filepath, index=False)
+        logger.info("Equity curve saved: %d rows → %s", len(df), filepath)
+
+    def save_metrics_csv(self, metrics: dict, filepath: str) -> None:
+        """Save metrics dict as a two-column CSV (metric_name, value)."""
+        rows = [{"metric": k, "value": v} for k, v in metrics.items()]
+        pd.DataFrame(rows).to_csv(filepath, index=False)
+        logger.info("Metrics saved: %d metrics → %s", len(rows), filepath)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE-LEVEL HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _metric_tiles(metrics: dict) -> str:
+    """Build the 5 large metric tiles as an HTML string."""
+    def _pct(v): return f"{v:.2%}" if v is not None else "N/A"
+    def _f3(v):  return f"{v:.2f}" if v is not None else "N/A"
+
+    cagr    = metrics.get("cagr", 0) or 0
+    sharpe  = metrics.get("sharpe_ratio", 0) or 0
+    max_dd  = metrics.get("max_drawdown_pct", 0) or 0
+    wr      = metrics.get("win_rate", 0) or 0
+    pf      = metrics.get("profit_factor", 0) or 0
+
+    def _css(val: float, lo: float, hi: float) -> str:
+        if val >= hi: return "good"
+        if val < lo:  return "bad"
+        return "neutral"
+
+    tiles = [
+        ("CAGR",         _pct(cagr),    _css(cagr, 0, 0.12)),
+        ("Sharpe Ratio", _f3(sharpe),   _css(sharpe, 0, 1.0)),
+        ("Max Drawdown", _pct(max_dd),  "bad" if max_dd < -0.20 else "neutral"),
+        ("Win Rate",     _pct(wr),      _css(wr, 0, 0.50)),
+        ("Profit Factor",_f3(pf),       _css(pf, 1.0, 1.5)),
+    ]
+    html = '<div class="tiles">'
+    for label, val, css in tiles:
+        html += (
+            f'<div class="tile {css}">'
+            f'<div class="label">{label}</div>'
+            f'<div class="value">{val}</div>'
+            f"</div>"
+        )
+    html += "</div>"
+    return html
+
+
+def _ts(val) -> str:
+    """Convert a datetime-like value to a short date string."""
+    if val is None:
+        return ""
+    try:
+        return pd.Timestamp(val).strftime("%Y-%m-%d")
+    except Exception:
+        return str(val)
+
+
+def _build_wf_report_df(wf_results: List[dict]) -> pd.DataFrame:
+    """Build a formatted DataFrame from walk-forward split results."""
+    if not wf_results:
+        return pd.DataFrame()
+    df = pd.DataFrame(wf_results)
+    col_map = {
+        "split_index":      "Split",
+        "test_start":       "Test Start",
+        "test_end":         "Test End",
+        "cagr":             "CAGR",
+        "sharpe_ratio":     "Sharpe",
+        "max_drawdown_pct": "Max DD",
+        "sortino_ratio":    "Sortino",
+        "win_rate":         "Win Rate",
+        "total_trades":     "# Trades",
+    }
+    avail = {k: v for k, v in col_map.items() if k in df.columns}
+    df    = df[list(avail.keys())].rename(columns=avail)
+    return df

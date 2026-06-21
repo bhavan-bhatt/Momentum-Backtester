@@ -1,237 +1,323 @@
 # performance/walk_forward.py
 # ============================================================
 # WALK-FORWARD VALIDATION ENGINE
-#
-# Splits historical data into anchored or rolling train/test windows,
-# runs a backtest on each test split, and aggregates out-of-sample
-# performance metrics across all splits.
-#
-# Window Types
-# ------------
-# Anchored  : Train window starts fixed; only end grows (expanding window).
-# Rolling   : Both start and end advance (fixed-size window). ← Implemented here.
-#
-# Each split:
-#   [train_start ──────── train_end] [test_start ── test_end]
-#                                    ↑ out-of-sample results
+# Splits data into rolling train/test windows, runs a full backtest
+# on each split, and aggregates out-of-sample metrics.
 # ============================================================
 
+import copy
+import itertools
 import logging
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Type
 
+import numpy as np
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
-from engine.data_handler import DataHandler
-from engine.backtest import build_backtest_engine
+from config import BacktestConfig, StrategyConfig
 from engine.strategy import BaseStrategy
-from performance.metrics import compute_all_metrics
-from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
-
-TRADING_DAYS_PER_YEAR = 252
-
-
-@dataclass
-class WalkForwardSplit:
-    """Represents one train/test split."""
-    split_idx:    int
-    train_start:  datetime
-    train_end:    datetime
-    test_start:   datetime
-    test_end:     datetime
-    train_bars:   int = 0
-    test_bars:    int = 0
-    metrics:      Dict[str, float] = field(default_factory=dict)
-    equity_curve: Optional[pd.Series] = None
 
 
 class WalkForwardEngine:
     """
-    Orchestrates walk-forward validation of a strategy.
+    Automates walk-forward validation to produce honest out-of-sample results.
 
-    Usage
-    -----
-    engine = WalkForwardEngine(config, strategy_cls)
-    results = engine.run()
-    summary = engine.summary()
+    Example (train_years=3, test_years=1)
+    --------------------------------------
+    Split 1: Train [2016 → 2018]  | Test [2019]
+    Split 2: Train [2017 → 2019]  | Test [2020]
+    Split 3: Train [2018 → 2020]  | Test [2021]
+    Split 4: Train [2019 → 2021]  | Test [2022]
 
-    Parameters
-    ----------
-    config        : BacktestConfig — master config (walk_forward sub-config used).
-    strategy_cls  : Type[Strategy] — strategy class to instantiate per split.
+    For each split:
+      1. (Optional) Optimise strategy params on training window.
+      2. Run a full backtest on the test window.
+      3. Record out-of-sample metrics.
+    Final result = aggregate (mean ± std) across all test windows.
     """
 
-    def __init__(self, config: BacktestConfig, strategy_cls: Type[BaseStrategy]) -> None:
+    def __init__(self, config: BacktestConfig) -> None:
         self._config       = config
-        self._strategy_cls = strategy_cls
-        self._splits:  List[WalkForwardSplit] = []
+        self.split_results: List[dict] = []
+        self.splits:        List[Tuple[str, str, str, str]] = []
 
-    def generate_splits(self, all_dates: List[datetime]) -> List["WalkForwardSplit"]:
+    # ──────────────────────────────────────────────────────────────────────
+    # SPLIT GENERATION
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_splits(self) -> List[Tuple[str, str, str, str]]:
         """
-        Produce train/test split metadata from a sorted list of trading dates.
-
-        Parameters
-        ----------
-        all_dates : List[datetime] — all common trading dates from DataHandler.
+        Generate all (train_start, train_end, test_start, test_end) date tuples.
 
         Returns
         -------
-        List[WalkForwardSplit] — one entry per test window.
+        List of 4-tuples of "YYYY-MM-DD" strings.
         """
-        wfcfg = self._config.walk_forward
-        train_days = wfcfg.train_years * TRADING_DAYS_PER_YEAR
-        test_days  = wfcfg.test_years  * TRADING_DAYS_PER_YEAR
-        step_days  = wfcfg.step_years  * TRADING_DAYS_PER_YEAR
+        wf   = self._config.walk_forward
+        data = self._config.data
 
-        splits: List[WalkForwardSplit] = []
-        n = len(all_dates)
-        split_idx = 0
-        cursor = 0  # index into all_dates where current train window begins
+        train_years = wf.train_years
+        test_years  = wf.test_years
+        step_years  = getattr(wf, "step_years", test_years)
 
-        while cursor + train_days + test_days <= n:
-            train_start_idx = cursor
-            train_end_idx   = cursor + train_days - 1
-            test_start_idx  = cursor + train_days
-            test_end_idx    = min(cursor + train_days + test_days - 1, n - 1)
+        data_start = datetime.strptime(data.start_date, "%Y-%m-%d")
+        data_end   = datetime.strptime(data.end_date,   "%Y-%m-%d")
 
-            train_bars = train_end_idx - train_start_idx + 1
-            test_bars  = test_end_idx  - test_start_idx  + 1
+        self.splits = []
+        current_train_start = data_start
 
-            if train_bars < wfcfg.min_train_bars:
-                logger.warning(
-                    "Split %d skipped: only %d train bars (min=%d).",
-                    split_idx, train_bars, wfcfg.min_train_bars,
-                )
-                cursor += step_days
+        while True:
+            train_end  = current_train_start + relativedelta(years=train_years) - timedelta(days=1)
+            test_start = train_end + timedelta(days=1)
+            test_end   = test_start + relativedelta(years=test_years) - timedelta(days=1)
+
+            if test_end > data_end:
+                break
+
+            self.splits.append((
+                current_train_start.strftime("%Y-%m-%d"),
+                train_end.strftime("%Y-%m-%d"),
+                test_start.strftime("%Y-%m-%d"),
+                test_end.strftime("%Y-%m-%d"),
+            ))
+
+            current_train_start += relativedelta(years=step_years)
+
+        logger.info("Generated %d walk-forward splits.", len(self.splits))
+        return self.splits
+
+    # ──────────────────────────────────────────────────────────────────────
+    # SINGLE SPLIT EXECUTION
+    # ──────────────────────────────────────────────────────────────────────
+
+    def run_single_split(
+        self,
+        train_start: str,
+        train_end: str,
+        test_start: str,
+        test_end: str,
+        strategy_class: Type[BaseStrategy],
+        split_index: int,
+    ) -> dict:
+        """
+        Run one full backtest on the test window and return its metrics.
+        """
+        logger.info(
+            "Split %d | test window: %s → %s", split_index, test_start, test_end
+        )
+
+        # ── Build config for this test window ─────────────────────────────
+        split_config = copy.deepcopy(self._config)
+        split_config.data.start_date = test_start
+        split_config.data.end_date   = test_end
+        split_config.verbose         = False   # quieter during WF runs
+
+        # ── Optional in-sample optimisation ──────────────────────────────
+        if split_config.walk_forward.optimize_in_train:
+            best_strategy_cfg = self._optimize_on_train(
+                train_start, train_end, strategy_class
+            )
+            split_config.strategy = best_strategy_cfg
+
+        # ── Wire up and run ───────────────────────────────────────────────
+        from collections import deque
+        from engine.data_handler import DataHandler
+        from engine.portfolio    import PortfolioManager
+        from engine.execution    import ExecutionHandler
+        from engine.backtest     import BacktestEngine
+
+        queue     = deque()
+        data      = DataHandler(split_config, queue)
+        strategy  = strategy_class(split_config, queue)
+        portfolio = PortfolioManager(split_config, queue)
+        execution = ExecutionHandler(split_config, queue)
+        engine    = BacktestEngine(split_config, data, strategy, portfolio, execution)
+
+        try:
+            results = engine.run()
+        except Exception as exc:
+            logger.error("Split %d failed: %s", split_index, exc)
+            return {
+                "split_index": split_index,
+                "train_start": train_start,
+                "train_end":   train_end,
+                "test_start":  test_start,
+                "test_end":    test_end,
+                "error":       str(exc),
+            }
+
+        m = results["metrics"]
+        m["split_index"] = split_index
+        m["train_start"] = train_start
+        m["train_end"]   = train_end
+        m["test_start"]  = test_start
+        m["test_end"]    = test_end
+        return m
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RUN ALL SPLITS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def run_all_splits(self, strategy_class: Type[BaseStrategy]) -> List[dict]:
+        """
+        Run every walk-forward split sequentially and collect results.
+        """
+        if not self.splits:
+            self.generate_splits()
+
+        if not self.splits:
+            raise RuntimeError("No walk-forward splits were generated.")
+
+        self.split_results = []
+        for i, (tr_s, tr_e, te_s, te_e) in enumerate(self.splits, start=1):
+            result = self.run_single_split(tr_s, tr_e, te_s, te_e, strategy_class, i)
+            self.split_results.append(result)
+
+        logger.info(
+            "All splits complete. %d out-of-sample results collected.",
+            len(self.split_results),
+        )
+        return self.split_results
+
+    # ──────────────────────────────────────────────────────────────────────
+    # AGGREGATE
+    # ──────────────────────────────────────────────────────────────────────
+
+    def aggregate_results(self) -> dict:
+        """
+        Compute mean and standard deviation of each metric across all splits.
+        """
+        if not self.split_results:
+            raise RuntimeError("No split results — run run_all_splits() first.")
+
+        df = pd.DataFrame(self.split_results)
+        numeric_cols = [
+            "sharpe_ratio", "max_drawdown_pct", "cagr", "sortino_ratio",
+            "calmar_ratio", "win_rate", "profit_factor", "total_trades",
+            "total_return_pct",
+        ]
+
+        agg: dict = {"n_splits": len(self.split_results), "per_split": self.split_results}
+        for col in numeric_cols:
+            if col in df.columns:
+                valid = df[col].dropna()
+                agg[col] = {
+                    "mean": round(float(valid.mean()), 4) if len(valid) > 0 else None,
+                    "std":  round(float(valid.std()),  4) if len(valid) > 1 else None,
+                }
+
+        return agg
+
+    # ──────────────────────────────────────────────────────────────────────
+    # OPTIONAL: IN-SAMPLE OPTIMISATION
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _optimize_on_train(
+        self,
+        train_start: str,
+        train_end: str,
+        strategy_class: Type[BaseStrategy],
+    ) -> StrategyConfig:
+        """
+        Simple grid search over key strategy parameters on the training window.
+
+        IMPORTANT: parameters are selected on IN-SAMPLE training data only,
+        then applied to the subsequent OUT-OF-SAMPLE test window. This is the
+        correct walk-forward procedure. Never use optimised params on train data
+        for the Sharpe comparison — compare on the unseen test split only.
+
+        Returns
+        -------
+        StrategyConfig — best-performing parameter set found on training data.
+        """
+        fast_windows = [10, 20, 30]
+        slow_windows = [40, 50, 100]
+        rsi_periods  = [10, 14, 20]
+
+        best_sharpe = float("-inf")
+        best_cfg    = copy.deepcopy(self._config.strategy)
+
+        from collections import deque
+        from engine.data_handler import DataHandler
+        from engine.portfolio    import PortfolioManager
+        from engine.execution    import ExecutionHandler
+        from engine.backtest     import BacktestEngine
+
+        for fast, slow, rsi in itertools.product(fast_windows, slow_windows, rsi_periods):
+            if fast >= slow:
                 continue
 
-            split = WalkForwardSplit(
-                split_idx   = split_idx,
-                train_start = all_dates[train_start_idx],
-                train_end   = all_dates[train_end_idx],
-                test_start  = all_dates[test_start_idx],
-                test_end    = all_dates[test_end_idx],
-                train_bars  = train_bars,
-                test_bars   = test_bars,
-            )
-            splits.append(split)
-            split_idx += 1
-            cursor    += step_days
-
-        logger.info("Generated %d walk-forward splits.", len(splits))
-        return splits
-
-    def run(self) -> List[WalkForwardSplit]:
-        """
-        Execute the full walk-forward validation.
-
-        For each split:
-          1. Clone config with test window's date range.
-          2. Run a full backtest on just the test window.
-          3. Compute out-of-sample performance metrics.
-          4. Store results in the split.
-
-        Returns
-        -------
-        List[WalkForwardSplit] with metrics populated.
-        """
-        # Build a temporary engine just to access aligned dates
-        temp_engine = build_backtest_engine(self._config, self._strategy_cls)
-        all_dates   = temp_engine.data_handler._all_dates
-        del temp_engine
-
-        splits = self.generate_splits(all_dates)
-        if not splits:
-            logger.error("No walk-forward splits generated. Check date range and window sizes.")
-            return []
-
-        self._splits = splits
-        rcfg = self._config.report
-
-        for split in splits:
-            if self._config.verbose:
-                print(
-                    f"\n[WF Split {split.split_idx + 1}/{len(splits)}]  "
-                    f"Train: {split.train_start.date()} → {split.train_end.date()}  "
-                    f"| Test: {split.test_start.date()} → {split.test_end.date()}"
-                )
-
-            # Clone config with test window's date range
-            test_cfg = self._make_test_config(split)
+            trial_config = copy.deepcopy(self._config)
+            trial_config.data.start_date          = train_start
+            trial_config.data.end_date            = train_end
+            trial_config.strategy.fast_ma_window  = fast
+            trial_config.strategy.slow_ma_window  = slow
+            trial_config.strategy.rsi_period      = rsi
+            trial_config.verbose                  = False
 
             try:
-                bt      = build_backtest_engine(test_cfg, self._strategy_cls)
-                results = bt.run()
-
-                equity    = results["equity_curve"]
-                trade_log = results["trade_log"]
-
-                bench_equity = None
-                if bt.data_handler.benchmark_data is not None:
-                    bench_eq = bt.data_handler.benchmark_data["close"]
-                    bench_equity = bench_eq / bench_eq.iloc[0] * test_cfg.portfolio.initial_capital
-
-                metrics = compute_all_metrics(
-                    equity,
-                    trade_log if trade_log is not None else pd.DataFrame(),
-                    benchmark_equity=bench_equity,
-                    risk_free_rate=rcfg.risk_free_rate,
-                    trading_days=rcfg.trading_days_per_year,
+                queue     = deque()
+                data      = DataHandler(trial_config, queue)
+                strategy  = strategy_class(trial_config, queue)
+                portfolio = PortfolioManager(trial_config, queue)
+                execution = ExecutionHandler(trial_config, queue)
+                engine    = BacktestEngine(
+                    trial_config, data, strategy, portfolio, execution
                 )
-                split.metrics      = metrics
-                split.equity_curve = equity
-
+                results = engine.run()
+                sharpe  = results["metrics"].get("sharpe_ratio", float("-inf"))
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_cfg    = copy.deepcopy(trial_config.strategy)
             except Exception as exc:
-                logger.error("Walk-forward split %d failed: %s", split.split_idx, exc)
-                split.metrics = {}
+                logger.debug(
+                    "Grid search trial (fast=%d, slow=%d, rsi=%d) failed: %s",
+                    fast, slow, rsi, exc,
+                )
 
-        return splits
+        logger.info(
+            "Train optimisation complete. Best Sharpe=%.3f  "
+            "fast=%d, slow=%d, rsi=%d",
+            best_sharpe, best_cfg.fast_ma_window, best_cfg.slow_ma_window, best_cfg.rsi_period,
+        )
+        return best_cfg
 
-    def summary(self) -> pd.DataFrame:
+    # ──────────────────────────────────────────────────────────────────────
+    # REPORT TABLE
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_walk_forward_report(self) -> pd.DataFrame:
         """
-        Return a DataFrame with one row per split and columns for each metric.
-        Also appends a final row with the mean across all splits.
+        Return a clean DataFrame of per-split and aggregate results.
         """
-        if not self._splits:
+        if not self.split_results:
             return pd.DataFrame()
 
-        rows = []
-        for s in self._splits:
-            row = {
-                "split":       s.split_idx + 1,
-                "train_start": s.train_start.date(),
-                "train_end":   s.train_end.date(),
-                "test_start":  s.test_start.date(),
-                "test_end":    s.test_end.date(),
-                "train_bars":  s.train_bars,
-                "test_bars":   s.test_bars,
-            }
-            row.update(s.metrics)
-            rows.append(row)
+        cols = {
+            "split_index":      "Split",
+            "test_start":       "Test Start",
+            "test_end":         "Test End",
+            "cagr":             "CAGR",
+            "sharpe_ratio":     "Sharpe",
+            "max_drawdown_pct": "Max DD",
+            "sortino_ratio":    "Sortino",
+            "win_rate":         "Win Rate",
+            "total_trades":     "# Trades",
+        }
 
-        df = pd.DataFrame(rows)
-        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        df = pd.DataFrame(self.split_results)
+        # Keep only columns that exist
+        avail = {k: v for k, v in cols.items() if k in df.columns}
+        df = df[list(avail.keys())].rename(columns=avail)
 
-        mean_row = {"split": "MEAN"}
-        for col in numeric_cols:
-            if col not in ("split", "train_bars", "test_bars"):
-                mean_row[col] = df[col].mean()
+        # Aggregate row
+        numeric_df = df.select_dtypes(include=[np.number])
+        agg_row    = numeric_df.mean().to_dict()
+        agg_row.update({"Split": "MEAN", "Test Start": "", "Test End": ""})
+        agg_series = pd.Series(agg_row)
+        df = pd.concat([df, agg_series.to_frame().T], ignore_index=True)
 
-        df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
         return df
-
-    def _make_test_config(self, split: WalkForwardSplit) -> BacktestConfig:
-        """
-        Return a BacktestConfig with start_date/end_date restricted to the
-        test window of this split.
-        """
-        import copy
-        cfg = copy.deepcopy(self._config)
-        cfg.data.start_date = split.test_start.strftime("%Y-%m-%d")
-        cfg.data.end_date   = split.test_end.strftime("%Y-%m-%d")
-        cfg.verbose         = False  # suppress per-split verbosity
-        return cfg
