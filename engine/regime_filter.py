@@ -30,6 +30,9 @@ class RegimeFilter:
         self.strategy_regime_map: Dict[str, str] = dict(
             config.advanced.regime.strategy_regime_map
         )
+        self.enable_gating: bool = getattr(
+            config.advanced.regime, "enable_gating", True
+        )
         self.current_regime = "trend"
         self.regime_history: List[Tuple[datetime, str]] = []
 
@@ -110,6 +113,8 @@ class RegimeFilter:
 
     def is_active(self, strategy_name: str) -> bool:
         """Return True if strategy may open new entries in the current regime."""
+        if not self.enable_gating:
+            return True
         required_regime = self.strategy_regime_map.get(strategy_name)
         if required_regime is None:
             return True

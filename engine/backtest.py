@@ -5,11 +5,13 @@
 # ============================================================
 
 import logging
+import sys
 import time
 from collections import deque
 from typing import Dict, Optional, Type
 
 import pandas as pd
+from tqdm import tqdm
 
 from engine.events import EventType, MarketEvent, SignalEvent, OrderEvent, FillEvent
 from engine.data_handler import DataHandler
@@ -104,37 +106,48 @@ class BacktestEngine:
 
         t_start = time.perf_counter()
 
+        n_symbols = len(symbols)
+        total_bars = self.data_handler.get_total_bars()
+        bar_desc = (
+            f"Backtest {start_date[:4]}→{end_date[:4]} | "
+            f"{n_symbols} stk × {total_bars} days"
+        )
+
         # ── MAIN LOOP ─────────────────────────────────────────────────────
-        while self.data_handler.has_more_bars():
-            self.data_handler.update_bars()
+        with tqdm(
+            total=total_bars,
+            desc=bar_desc,
+            unit="day",
+            file=sys.stdout,
+            dynamic_ncols=True,
+            mininterval=0.5,
+        ) as pbar:
+            while self.data_handler.has_more_bars():
+                self.data_handler.update_bars()
 
-            current_dt = self.data_handler.get_current_datetime()
-            if self.regime_filter is not None and current_dt is not None:
-                self.regime_filter.update(current_dt, self.data_handler)
-            if self.ensemble_allocator is not None and current_dt is not None:
-                self.ensemble_allocator.maybe_rebalance(current_dt)
+                current_dt = self.data_handler.get_current_datetime()
+                if self.regime_filter is not None and current_dt is not None:
+                    self.regime_filter.update(current_dt, self.data_handler)
+                if self.ensemble_allocator is not None and current_dt is not None:
+                    self.ensemble_allocator.maybe_rebalance(current_dt)
 
-            while self.event_queue:
-                event = self.event_queue.popleft()
-                self._process_event(event)
-                self._event_count += 1
+                while self.event_queue:
+                    event = self.event_queue.popleft()
+                    self._process_event(event)
+                    self._event_count += 1
 
-            self._iteration_count += 1
+                self._iteration_count += 1
 
-            current_dt = self.data_handler.get_current_datetime()
-            if current_dt is not None:
-                self.portfolio.record_equity(current_dt, self.data_handler)
+                current_dt = self.data_handler.get_current_datetime()
+                if current_dt is not None:
+                    self.portfolio.record_equity(current_dt, self.data_handler)
+                    pbar.set_postfix(
+                        date=current_dt.strftime("%Y-%m-%d"),
+                        eq=f"₹{self.portfolio.get_final_equity():,.0f}",
+                        refresh=False,
+                    )
 
-            if (
-                self._config.verbose
-                and self._iteration_count % 252 == 0
-                and current_dt is not None
-            ):
-                eq = self.portfolio.get_final_equity()
-                print(
-                    f"  {current_dt.strftime('%Y')} processed. "
-                    f"Portfolio value: ₹{eq:,.0f}"
-                )
+                pbar.update(1)
 
         # ── FINALISE ──────────────────────────────────────────────────────
         self._finalise()
@@ -174,9 +187,33 @@ class BacktestEngine:
 
         elif etype == EventType.FILL:
             self.portfolio.update_portfolio_on_fill(event)
+            self._notify_strategy_fill(event)
 
         else:
             logger.warning("Unrecognised event type: %s — skipped.", etype)
+
+    def _notify_strategy_fill(self, fill: FillEvent) -> None:
+        """Sync originating strategy position state after a fill."""
+        if fill.order_ref is None or fill.order_ref.signal_ref is None:
+            return
+        origin_id = fill.order_ref.signal_ref.strategy_id
+        targets = (
+            self.strategies if hasattr(self, "strategies") and self.strategies
+            else [self.strategy]
+        )
+        for strategy in targets:
+            if strategy is None or not hasattr(strategy, "on_fill"):
+                continue
+            if getattr(strategy, "strategy_id", "") == origin_id:
+                strategy.on_fill(fill)
+                return
+        for strategy in targets:
+            if strategy is None or not hasattr(strategy, "on_fill"):
+                continue
+            sid = getattr(strategy, "strategy_id", "")
+            if sid and origin_id.startswith(sid.split("_")[0] + "_"):
+                strategy.on_fill(fill)
+                return
 
     def _finalise(self) -> None:
         """

@@ -22,11 +22,25 @@ from typing import Dict, List, Optional
 from config import BacktestConfig
 
 _PALETTE = {
-    "portfolio": "#1f77b4",
-    "benchmark": "#9e9e9e",
-    "green":     "#2ca02c",
-    "red":       "#d62728",
-    "yellow":    "#ff7f0e",
+    "portfolio": "#2563eb",
+    "benchmark": "#94a3b8",
+    "nifty500": "#64748b",
+    "equal_weight": "#cbd5e1",
+    "green":     "#16a34a",
+    "red":       "#dc2626",
+    "yellow":    "#d97706",
+    "accent":    "#0f172a",
+}
+
+_REPORT_COLORS = {
+    "bg": "#fafafa",
+    "surface": "#ffffff",
+    "border": "#e5e7eb",
+    "text": "#111827",
+    "muted": "#6b7280",
+    "accent": "#2563eb",
+    "positive": "#059669",
+    "negative": "#dc2626",
 }
 
 
@@ -440,6 +454,98 @@ def plotly_equity_curve(
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
         height=450,
         template="plotly_white",
+        font={"family": "Inter, system-ui, sans-serif", "size": 12},
+        paper_bgcolor="white",
+        plot_bgcolor="#fafafa",
+    )
+    return fig
+
+
+def plotly_multi_benchmark_equity(
+    equity_curve: pd.Series,
+    benchmark_curves: Dict[str, pd.Series],
+    metrics: dict,
+) -> go.Figure:
+    """Indexed equity curves for strategy vs multiple benchmarks."""
+    port_idx = equity_curve / equity_curve.iloc[0] * 100
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=port_idx.index, y=port_idx.values,
+        name="Strategy", mode="lines",
+        line={"color": _PALETTE["portfolio"], "width": 2.5},
+        hovertemplate="<b>Strategy</b><br>%{x|%Y-%m-%d}<br>%{y:.1f}<extra></extra>",
+    ))
+
+    dash_styles = {
+        "Nifty 50": {"color": _PALETTE["benchmark"], "width": 1.5, "dash": "dot"},
+        "Nifty 500": {"color": _PALETTE["nifty500"], "width": 1.5, "dash": "dash"},
+        "Equal-Weight Basket": {"color": _PALETTE["equal_weight"], "width": 1.8, "dash": "solid"},
+    }
+    for label, curve in benchmark_curves.items():
+        if curve is None or len(curve) < 2:
+            continue
+        idx = (curve / curve.iloc[0] * 100).reindex(port_idx.index, method="ffill")
+        style = dash_styles.get(label, {"color": "#9ca3af", "width": 1.2, "dash": "solid"})
+        fig.add_trace(go.Scatter(
+            x=idx.index, y=idx.values,
+            name=label, mode="lines",
+            line=style,
+            hovertemplate=f"<b>{label}</b><br>%{{x|%Y-%m-%d}}<br>%{{y:.1f}}<extra></extra>",
+        ))
+
+    cagr = metrics.get("cagr", 0)
+    sharpe = metrics.get("sharpe_ratio", 0)
+    max_dd = metrics.get("max_drawdown_pct", 0)
+
+    fig.update_layout(
+        title=None,
+        xaxis_title="",
+        yaxis_title="Indexed (100 = start)",
+        hovermode="x unified",
+        legend={
+            "orientation": "h", "yanchor": "bottom", "y": 1.02,
+            "x": 0, "font": {"size": 11},
+        },
+        height=420,
+        margin={"l": 48, "r": 24, "t": 24, "b": 40},
+        template="plotly_white",
+        font={"family": "Inter, system-ui, sans-serif", "size": 12},
+        paper_bgcolor="white",
+        plot_bgcolor="#fafafa",
+        xaxis={"showgrid": True, "gridcolor": "#f1f5f9", "zeroline": False},
+        yaxis={"showgrid": True, "gridcolor": "#f1f5f9", "zeroline": False},
+        annotations=[{
+            "x": 0.01, "y": 0.98, "xref": "paper", "yref": "paper",
+            "text": f"CAGR {cagr:.1%} · Sharpe {sharpe:.2f} · Max DD {max_dd:.1%}",
+            "showarrow": False, "align": "left",
+            "font": {"size": 11, "color": "#64748b"},
+        }],
+    )
+    return fig
+
+
+def plotly_underwater(equity_curve: pd.Series) -> go.Figure:
+    """Minimal drawdown chart for embedded reports."""
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=drawdown.index, y=drawdown.values,
+        mode="lines", name="Drawdown",
+        fill="tozeroy",
+        fillcolor="rgba(220,38,38,0.08)",
+        line={"color": "rgba(220,38,38,0.65)", "width": 1.2},
+        hovertemplate="%{x|%Y-%m-%d}<br>DD %{y:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title=None, height=280, margin={"l": 48, "r": 16, "t": 12, "b": 36},
+        template="plotly_white",
+        font={"family": "Inter, system-ui, sans-serif", "size": 11},
+        paper_bgcolor="white", plot_bgcolor="#fafafa",
+        xaxis={"showgrid": False}, yaxis={"title": "Drawdown %", "gridcolor": "#f1f5f9"},
+        showlegend=False,
     )
     return fig
 

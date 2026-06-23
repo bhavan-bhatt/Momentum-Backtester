@@ -1,28 +1,55 @@
 data:
-  symbols:
-    - RELIANCE.NS
-    - INFY.NS
-    - TCS.NS
-    - HDFCBANK.NS
-    - WIPRO.NS
+  symbols_file: symbols_n150.txt
   benchmark_symbol: "^NSEI"
+  secondary_benchmark_symbol: "^CRSLDX"
   start_date: "2018-01-01"
-  end_date: "2026-12-31"
+  end_date: "2026-06-23"
+  max_gap_fill: 5
 
 strategy:
-  fast_ma_window: 20
-  slow_ma_window: 50
+  fast_ma_window: 12
+  slow_ma_window: 40
+  ma_type: EMA
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  atr_period: 14
+  atr_stop_multiplier: 2.5
   allow_short: false
 
+portfolio:
+  initial_capital: 1000000
+  max_open_positions: 95
+  risk_per_trade_pct: 0.04
+  max_position_pct: 0.0105
+  max_total_exposure_pct: 0.995
+  sizing_method: equal_weight
+
 advanced:
+  cross_sectional:
+    lookback_months: 12
+    skip_recent_days: 0
+    top_decile_pct: 0.62
+    bottom_decile_pct: 0.0
+    rebalance_freq: monthly
+  breakout:
+    donchian_window: 20
+    atr_breakout_multiplier: 0.6
   ensemble:
     enabled_strategies:
-      - DualMA
-      - RSI
       - CrossSectionalMomentum
-      - VolatilityBreakout
-    weighting_method: equal_vol
+    weighting_method: equal_weight
+    max_sleeve_weight: 1.0
+  regime:
+    enable_gating: false
   statistics:
     n_strategies_tested: 6
+    bootstrap_n_iterations: 1000
   constituents:
-    enforce_point_in_time: true
+    enforce_point_in_time: false
+
+report:
+  save_charts_png: true
+  save_html_report: true
+
+verbose: true

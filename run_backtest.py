@@ -15,6 +15,10 @@ import os
 import sys
 from collections import deque
 
+from runtime_checks import check_python_version
+
+check_python_version()
+
 from config import CONFIG, BacktestConfig
 from engine.backtest import BacktestEngine
 from engine.data_handler import DataHandler

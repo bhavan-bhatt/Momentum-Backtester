@@ -121,11 +121,8 @@ class BaseStrategy(ABC):
             direction=direction,
             strength=max(0.0, min(1.0, strength)),
         )
-        # Update strategy-level position tracking
-        if direction in (SignalDirection.LONG, SignalDirection.SHORT):
-            self.current_positions[symbol] = direction
-        elif direction in (SignalDirection.EXIT_LONG, SignalDirection.EXIT_SHORT):
-            self.current_positions[symbol] = None
+        # Position state is updated on fill (on_fill), not here, so failed
+        # orders (qty=0, blocked by portfolio) do not desync strategy state.
 
         self._event_queue.append(signal)
 
@@ -145,6 +142,29 @@ class BaseStrategy(ABC):
             timestamp.date() if hasattr(timestamp, "date") else timestamp,
             strength,
         )
+
+    def on_fill(self, fill: "FillEvent") -> None:
+        """Update strategy-level position tracking after a confirmed fill."""
+        from engine.events import FillEvent, OrderDirection
+
+        if not isinstance(fill, FillEvent):
+            return
+        if fill.order_ref is None or fill.order_ref.signal_ref is None:
+            return
+
+        symbol = fill.symbol
+        sig_dir = fill.order_ref.signal_ref.direction
+
+        if fill.direction == OrderDirection.BUY:
+            if sig_dir == SignalDirection.LONG:
+                self.current_positions[symbol] = SignalDirection.LONG
+            elif sig_dir == SignalDirection.EXIT_SHORT:
+                self.current_positions[symbol] = None
+        elif fill.direction == OrderDirection.SELL:
+            if sig_dir == SignalDirection.EXIT_LONG:
+                self.current_positions[symbol] = None
+            elif sig_dir == SignalDirection.SHORT:
+                self.current_positions[symbol] = SignalDirection.SHORT
 
     # ──────────────────────────────────────────────────────────────────────
     # POSITION STATE HELPERS

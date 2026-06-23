@@ -1,7 +1,28 @@
-# Backtester — Event-Driven Quantitative Backtesting Framework
+# Momentum Backtester — Event-Driven Quant Framework (NSE)
 
-A production-quality, event-driven backtesting system for Indian equities (NSE).
-Supports multiple strategies, realistic transaction cost modelling, and walk-forward validation.
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+
+A production-quality, event-driven backtesting system for **Indian equities (NSE)**.
+Supports cross-sectional momentum, ensemble strategies, realistic NSE transaction costs,
+and walk-forward validation.
+
+**Latest research results → [docs/RESULTS.md](docs/RESULTS.md)**  
+*(17.84% CAGR · 301% total return · 150 stocks · beats equal-weight basket)*
+
+---
+
+## Reproduce in 3 commands
+
+```bash
+pip install -r requirements.txt
+./scripts/reproduce.sh          # download data → backtest → publish docs/results/
+open docs/results/latest_report.html
+```
+
+Market data is **not** in git. The reproduce script downloads 150 stocks + Nifty 50/500
+benchmarks from Yahoo Finance. See [`csv/README.md`](csv/README.md).
+
+**Python:** 3.9+ required (3.10+ recommended on Apple Silicon — system 3.8 is too slow).
 
 ---
 
@@ -9,23 +30,26 @@ Supports multiple strategies, realistic transaction cost modelling, and walk-for
 
 ```
 backtester/
-├── csv/                 # Market data CSVs (one file per symbol)
-│   └── constituents/    # Point-in-time Nifty 50 membership (Phase 2)
+├── csv/                 # Market data (gitignored — download via script)
+│   └── constituents/    # Sample Nifty 50 membership (committed)
+├── docs/
+│   ├── RESULTS.md       # Published research summary + charts
+│   └── results/         # Committed charts, metrics, HTML reports
+├── configs/             # YAML configs + symbol universes (n100, n150)
+├── scripts/
+│   ├── download_yfinance.py
+│   ├── reproduce.sh     # Full end-to-end reproduction
+│   ├── run_research.sh
+│   └── publish_results.py
 ├── engine/              # Core event loop, data handler, portfolio, execution
-├── strategies/          # Concrete strategy implementations
-├── portfolio/           # Multi-strategy ensemble (Phase 2)
-├── performance/         # Metrics library + walk-forward engine
+├── strategies/          # Strategy implementations
+├── portfolio/           # Multi-strategy ensemble
+├── performance/         # Metrics + walk-forward
 ├── reports/             # Chart functions + HTML report generator
-├── data/                # CSV normalisation + index constituents
-├── configs/             # YAML strategy / ensemble configs (Phase 2)
-├── tests/               # Unit tests (pytest)
-├── output/              # Auto-created at runtime
-│   ├── reports/         # HTML reports
-│   ├── charts/          # PNG charts
-│   └── logs/            # Run logs
-├── config.py            # All parameters — single source of truth
-├── run_backtest.py      # Entry point: single backtest
-└── run_walk_forward.py  # Entry point: walk-forward validation
+├── tests/               # pytest suite
+├── output/              # Runtime outputs (gitignored)
+├── run_research.py      # Phase 2 research pipeline entry point
+└── run_backtest.py      # Single-strategy backtest entry point
 ```
 
 ---
@@ -38,15 +62,18 @@ backtester/
 pip install -r requirements.txt
 ```
 
-### 2. Add your CSV data
+### 2. Download market data
 
-Place CSV files in the `csv/` directory.  
-File naming must match the symbols in `config.py`:
-- `RELIANCE.NS.csv`
-- `INFY.NS.csv`
-- `^NSEI.csv` (benchmark)
+```bash
+python scripts/download_yfinance.py \
+  --symbols-file configs/symbols_n150.txt \
+  --start 2018-01-01 --end 2026-06-23 \
+  --output-dir csv
+```
 
-See [Data Contract](#data-contract) for accepted formats.
+Or use the all-in-one script: `./scripts/reproduce.sh`
+
+CSV files are gitignored. See [`csv/README.md`](csv/README.md) and [Data Contract](#data-contract).
 
 ### 3. Run a backtest
 
@@ -150,13 +177,17 @@ Phase 2 settings live under `config.advanced` and are fully backward compatible 
 
 ```bash
 # Full ensemble research run from YAML config
-python run_research.py --config configs/base.yaml
+./scripts/run_research.sh --config configs/base.yaml
+
+# Publish charts + metrics to docs/results/ for GitHub
+python scripts/publish_results.py
 
 # With walk-forward parameter stability (slow)
-python run_research.py --config configs/ensemble_all.yaml --with-stability
+python run_research.py --config configs/base.yaml --with-stability
 ```
 
-See `configs/README.md` for available YAML configs.
+See [`docs/RESULTS.md`](docs/RESULTS.md) for the latest published run and
+[`configs/README.md`](configs/README.md) for available YAML configs.
 
 #### Planned (Phase 2 modules)
 - **Ensemble** — risk-parity combination of strategy sleeves via `portfolio/ensemble.py`
@@ -217,10 +248,19 @@ See `configs/README.md` for available YAML configs.
 
 ## Output Files
 
-After a run, the `output/` directory contains:
-- `output/reports/` — Self-contained HTML report with interactive Plotly chart
-- `output/charts/` — Static PNG charts (equity curve, monthly heatmap, trade analysis)
-- `output/` — Equity curve CSV and trade log CSV
+After a run, **`output/`** (gitignored) contains full logs and charts.
+
+To publish a summary for GitHub:
+
+```bash
+python scripts/publish_results.py
+```
+
+This copies the latest run into **`docs/results/`** (committed):
+- `docs/RESULTS.md` — markdown summary with embedded charts
+- `docs/results/charts/` — PNG charts
+- `docs/results/latest_report.html` — interactive Plotly report
+- `docs/results/metrics.csv` — machine-readable metrics
 
 ---
 
@@ -254,15 +294,17 @@ All modules communicate exclusively through events. No direct calls between modu
 
 ---
 
-## Replacing Demo Data
+## Replacing / Refreshing Data
 
-1. Download historical data from yfinance, NSEpy, or Kite API.
-2. Place CSVs in the `csv/` directory with filenames matching `config.data.symbols`.
-3. Optionally run the preprocessor to normalise formats:
+1. Edit the symbol list in `configs/symbols_n150.txt` (or `symbols_n100.txt`).
+2. Download fresh OHLCV:
    ```bash
-   python -m data.preprocessor --csv_dir csv --output_dir csv
+   python scripts/download_yfinance.py \
+     --symbols-file configs/symbols_n150.txt \
+     --start 2018-01-01 --end 2026-06-23 --output-dir csv
    ```
-4. Run the backtest.
+3. Run `./scripts/run_research.sh` and `python scripts/publish_results.py`.
+4. Optionally run `python -m data.preprocessor --csv_dir csv --output_dir csv` to normalise formats.
 
 ---
 

@@ -50,6 +50,9 @@ class ResearchBacktestEngine(BacktestEngine):
         )
         self.strategies = strategies
         self.audit_log = audit_log
+        # Wire every sleeve to the engine queue (super() only connects primary).
+        for s in strategies:
+            s._event_queue = self.event_queue
         self._prev_equity: Optional[float] = None
         self._sleeve_prev_equity: Dict[str, float] = {
             sid: config.portfolio.initial_capital / max(len(strategies), 1)

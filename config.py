@@ -21,6 +21,8 @@ class DataConfig:
         "WIPRO.NS",
     ])
     benchmark_symbol: str = "^NSEI"
+    secondary_benchmark_symbol: Optional[str] = None
+    symbols_file: Optional[str] = None
     start_date: str = "2018-01-01"
     end_date: str = "2026-12-31"
     price_column: str = "auto"
@@ -151,6 +153,7 @@ class VolatilityBreakoutConfig:
 class RegimeFilterConfig:
     """Market regime detection — turns strategies on/off based on market state."""
 
+    enable_gating: bool = True
     method: str = "sma_200"
     adx_threshold: float = 25.0
     sma_window: int = 200

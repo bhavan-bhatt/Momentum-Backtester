@@ -67,6 +67,33 @@ def _build_advanced(raw: Dict[str, Any]) -> AdvancedConfig:
     )
 
 
+def load_symbols_from_file(filepath: str) -> List[str]:
+    """Load ticker symbols from a text file (one per line, # comments ignored)."""
+    symbols: List[str] = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            symbols.append(line)
+    return symbols
+
+
+def _resolve_symbols_file(data_raw: Dict[str, Any], config_path: str) -> Dict[str, Any]:
+    """If symbols_file is set, load symbols list from that path."""
+    data_raw = dict(data_raw)
+    sym_file = data_raw.pop("symbols_file", None)
+    if sym_file:
+        if not os.path.isabs(sym_file):
+            base = os.path.dirname(os.path.abspath(config_path))
+            sym_file = os.path.join(base, sym_file)
+        if not os.path.exists(sym_file):
+            raise FileNotFoundError(f"symbols_file not found: {sym_file}")
+        data_raw["symbols"] = load_symbols_from_file(sym_file)
+        logger.info("Loaded %d symbols from %s", len(data_raw["symbols"]), sym_file)
+    return data_raw
+
+
 def load_config_from_yaml(filepath: str) -> BacktestConfig:
     """Load a complete BacktestConfig from a YAML file."""
     with open(filepath, "r", encoding="utf-8") as f:
@@ -78,8 +105,10 @@ def load_config_from_yaml(filepath: str) -> BacktestConfig:
     if unknown_top:
         raise ValueError(f"Unknown top-level config keys: {unknown_top}")
 
+    data_raw = _resolve_symbols_file(raw.get("data", {}), filepath)
+
     config = BacktestConfig(
-        data=_build_dataclass(DataConfig, raw.get("data", {})),
+        data=_build_dataclass(DataConfig, data_raw),
         strategy=_build_dataclass(StrategyConfig, raw.get("strategy", {})),
         portfolio=_build_dataclass(PortfolioConfig, raw.get("portfolio", {})),
         execution=_build_dataclass(ExecutionConfig, raw.get("execution", {})),

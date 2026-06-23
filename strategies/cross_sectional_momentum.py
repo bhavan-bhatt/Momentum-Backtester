@@ -51,6 +51,7 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         self.current_longs: Set[str] = set()
         self.current_shorts: Set[str] = set()
         self.last_rebalance_date: Optional[datetime] = None
+        self._warned_small_universe = False
 
         self.strategy_id = f"CrossSectionalMomentum_{self.lookback_months}m"
         self.all_symbols = list(config.data.symbols)
@@ -59,6 +60,9 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
     def calculate_signals(self, event: MarketEvent, data_handler) -> None:
         """Run cross-sectional ranking and emit signals on rebalance dates."""
         if not self.all_symbols or event.symbol != self.all_symbols[0]:
+            return
+
+        if data_handler.get_bar_index() < self.required_bars:
             return
 
         if not self._is_rebalance_date(event.timestamp):
@@ -70,11 +74,14 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         )
 
         if len(momentum_scores) < 2:
-            logger.warning(
-                "[%s] Universe too small to rank (%d symbols with valid scores).",
-                self.strategy_id,
-                len(momentum_scores),
-            )
+            if not self._warned_small_universe:
+                logger.warning(
+                    "[%s] Universe too small to rank (%d symbols with valid scores). "
+                    "Add more symbols or reduce lookback_months.",
+                    self.strategy_id,
+                    len(momentum_scores),
+                )
+                self._warned_small_universe = True
             return
 
         new_longs, new_shorts = self._rank_and_select(momentum_scores)
@@ -172,8 +179,12 @@ class CrossSectionalMomentumStrategy(BaseStrategy):
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         n = len(ranked)
 
-        n_long = max(1, int(n * self.top_decile_pct))
-        n_short = int(n * self.bottom_decile_pct) if self.allow_short else 0
+        if n <= 8:
+            n_long = max(1, n // 2)
+            n_short = max(0, n // 3) if self.allow_short else 0
+        else:
+            n_long = max(1, int(n * self.top_decile_pct))
+            n_short = int(n * self.bottom_decile_pct) if self.allow_short else 0
 
         longs = {symbol for symbol, _ in ranked[:n_long]}
         shorts = (

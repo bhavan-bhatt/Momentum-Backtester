@@ -1,0 +1,24 @@
+{
+  "run_date": "2026-06-24",
+  "period": "2018-01-02 to 2026-06-22",
+  "universe_size": 150,
+  "strategy": "CrossSectionalMomentum",
+  "initial_capital_inr": 1000000,
+  "ending_capital_inr": 4016697.18,
+  "cagr": 0.1784,
+  "total_return_pct": 3.0167,
+  "sharpe_ratio": 0.6924,
+  "sortino_ratio": 0.7598,
+  "max_drawdown_pct": -0.3654,
+  "alpha_vs_nifty50": 0.0883,
+  "beta_vs_nifty50": 0.8269,
+  "total_trades": 713,
+  "benchmarks": [
+    {"label": "Nifty 50", "benchmark_return": 1.3082, "alpha": 1.7085},
+    {"label": "Nifty 50 (cost-adjusted)", "benchmark_return": 1.3051, "alpha": 1.7116},
+    {"label": "Nifty 500", "benchmark_return": 1.4700, "alpha": 1.5467},
+    {"label": "Nifty 500 (cost-adjusted)", "benchmark_return": 1.4667, "alpha": 1.5500},
+    {"label": "Equal-Weight Basket", "benchmark_return": 3.0125, "alpha": 0.0042},
+    {"label": "Equal-Weight Basket (cost-adjusted)", "benchmark_return": 3.0071, "alpha": 0.0096}
+  ]
+}

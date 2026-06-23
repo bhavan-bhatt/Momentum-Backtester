@@ -5,11 +5,13 @@
 # ============================================================
 
 import math
+import sys
 from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+from tqdm import tqdm
 
 from config import BacktestConfig
 
@@ -49,7 +51,13 @@ class StatisticalTests:
         max_start = max(n - self.block_size, 1)
         bootstrap_sharpes = np.empty(self.n_iterations)
 
-        for i in range(self.n_iterations):
+        for i in tqdm(
+            range(self.n_iterations),
+            desc=f"Bootstrap Sharpe ({self.n_iterations} draws)",
+            unit="iter",
+            file=sys.stdout,
+            leave=False,
+        ):
             starts = np.random.randint(0, max_start, size=n_blocks)
             blocks = [returns_arr[s : s + self.block_size] for s in starts]
             resampled = np.concatenate(blocks)[:n]

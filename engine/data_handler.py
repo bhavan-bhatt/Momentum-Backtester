@@ -68,6 +68,7 @@ class DataHandler:
 
         self.symbol_data: Dict[str, pd.DataFrame] = {}
         self.benchmark_data: Optional[pd.DataFrame] = None
+        self.secondary_benchmark_data: Optional[pd.DataFrame] = None
         self.has_high_low: Dict[str, bool] = {}
         self.has_volume: Dict[str, bool] = {}
 
@@ -88,6 +89,30 @@ class DataHandler:
                 "Check csv_dir and symbol names in config."
             )
 
+        # Drop symbols listed after backtest start (inner join would shrink the window).
+        start = pd.Timestamp(self._config.data.start_date)
+        min_first_date = start + pd.Timedelta(days=5)
+        dropped: List[str] = []
+        for symbol in list(self.symbol_data.keys()):
+            first_bar = self.symbol_data[symbol].index.min()
+            if first_bar > min_first_date:
+                dropped.append(symbol)
+                del self.symbol_data[symbol]
+                self.has_high_low.pop(symbol, None)
+                self.has_volume.pop(symbol, None)
+        if dropped:
+            logger.warning(
+                "Dropped %d symbol(s) with no history from %s: %s",
+                len(dropped),
+                self._config.data.start_date,
+                ", ".join(dropped[:8]) + ("..." if len(dropped) > 8 else ""),
+            )
+        if not self.symbol_data:
+            raise RuntimeError(
+                "DataHandler: No symbols remain after history filter. "
+                "Use older/larger-cap names or an earlier start_date."
+            )
+
         # ── Load benchmark ───────────────────────────────────────────────
         bench = self._load_and_normalise(config.data.benchmark_symbol)
         if bench is None:
@@ -96,6 +121,16 @@ class DataHandler:
                 config.data.benchmark_symbol,
             )
         self.benchmark_data = bench
+
+        sec_sym = getattr(config.data, "secondary_benchmark_symbol", None)
+        if sec_sym:
+            sec_bench = self._load_and_normalise(sec_sym)
+            if sec_bench is None:
+                logger.warning(
+                    "Secondary benchmark %s not loaded — Nifty 500 comparison unavailable.",
+                    sec_sym,
+                )
+            self.secondary_benchmark_data = sec_bench
 
         # ── Align to common dates and trim to config date range ──────────
         self._align_dates()
@@ -289,6 +324,11 @@ class DataHandler:
         if self.benchmark_data is not None:
             self.benchmark_data = self.benchmark_data.reindex(dt_index).fillna(method="ffill")
 
+        if self.secondary_benchmark_data is not None:
+            self.secondary_benchmark_data = (
+                self.secondary_benchmark_data.reindex(dt_index).fillna(method="ffill")
+            )
+
         logger.info(
             "Aligned to %d common trading days: %s → %s",
             len(sorted_dates),
@@ -335,6 +375,14 @@ class DataHandler:
     def has_more_bars(self) -> bool:
         """True if there are more bars remaining in the simulation."""
         return self._bar_index < len(self._all_dates)
+
+    def get_total_bars(self) -> int:
+        """Total number of aligned trading days in the simulation."""
+        return len(self._all_dates)
+
+    def get_bar_index(self) -> int:
+        """Current bar pointer (0 before first update_bars(), then 1…total)."""
+        return self._bar_index
 
     # ──────────────────────────────────────────────────────────────────────
     # PUBLIC INTERFACE — DATA ACCESS

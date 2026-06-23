@@ -22,6 +22,9 @@ from reports.charts import (
     plot_rolling_sharpe,
     plot_walk_forward_results,
     plotly_combined_dashboard,
+    plotly_multi_benchmark_equity,
+    plotly_underwater,
+    plotly_monthly_heatmap,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,9 @@ class ReportGenerator:
         benchmark_curve: Optional[pd.Series] = None,
         wf_results: Optional[List[dict]] = None,
         strategy_name: str = "Strategy",
+        bench_comparisons: Optional[List[dict]] = None,
+        benchmark_curves: Optional[Dict[str, pd.Series]] = None,
+        advanced_analysis: Optional[dict] = None,
     ) -> str:
         """
         Generate every output file and return the path to the main HTML report.
@@ -131,10 +137,34 @@ class ReportGenerator:
         except Exception as exc:
             logger.warning("Plotly dashboard failed: %s", exc)
 
+        # ── Embedded Plotly fragments for main report ─────────────────────
+        plotly_fragments: Dict[str, str] = {}
+        try:
+            curves = benchmark_curves or {}
+            if benchmark_curve is not None and "Nifty 50" not in curves:
+                curves = {"Nifty 50": benchmark_curve, **curves}
+            fig_eq = plotly_multi_benchmark_equity(equity_curve, curves, metrics)
+            plotly_fragments["equity"] = fig_eq.to_html(
+                full_html=False, include_plotlyjs=False, config={"displayModeBar": False}
+            )
+            fig_dd = plotly_underwater(equity_curve)
+            plotly_fragments["drawdown"] = fig_dd.to_html(
+                full_html=False, include_plotlyjs=False, config={"displayModeBar": False}
+            )
+            fig_hm = plotly_monthly_heatmap(monthly_returns)
+            plotly_fragments["monthly"] = fig_hm.to_html(
+                full_html=False, include_plotlyjs=False, config={"displayModeBar": False}
+            )
+        except Exception as exc:
+            logger.warning("Embedded Plotly charts failed: %s", exc)
+
         # ── Full HTML report ──────────────────────────────────────────────
         html     = self._build_html_report(
             equity_curve, trade_log, metrics, monthly_returns,
             benchmark_curve, wf_results, strategy_name, chart_paths,
+            bench_comparisons=bench_comparisons or [],
+            plotly_fragments=plotly_fragments,
+            advanced_analysis=advanced_analysis,
         )
         rep_path = os.path.join(self._dirs["reports"], f"{self.run_id}_report.html")
         with open(rep_path, "w", encoding="utf-8") as fh:
@@ -163,61 +193,13 @@ class ReportGenerator:
         advanced_analysis: dict,
         audit_log=None,
     ) -> None:
-        """Append Phase 2 analysis sections to an existing HTML report."""
+        """Legacy hook — advanced sections are now built into the main report."""
         if not os.path.exists(report_path):
             logger.warning("Report not found for advanced sections: %s", report_path)
             return
 
-        dsr = advanced_analysis.get("deflated_sharpe", {})
-        ci = advanced_analysis.get("sharpe_ci", {})
-        jb = advanced_analysis.get("jarque_bera", {})
-        turnover = advanced_analysis.get("turnover", {})
-        capacity = advanced_analysis.get("capacity", {})
-        bench_rows = advanced_analysis.get("benchmark_comparisons", [])
-
-        bench_html = ""
-        for b in bench_rows:
-            bench_html += (
-                f"<tr><td>{b.get('benchmark_label','')}</td>"
-                f"<td>{b.get('strategy_total_return',0):.2%}</td>"
-                f"<td>{b.get('benchmark_total_return',0):.2%}</td>"
-                f"<td>{b.get('outperformance',0):+.2%}</td></tr>"
-            )
-
-        extra = f"""
-<section>
-  <h2>Statistical Significance</h2>
-  <table class="data-table">
-    <tr><td>Bootstrap Sharpe CI</td>
-        <td>{ci.get('point',0):.2f} [{ci.get('lower',0):.2f}, {ci.get('upper',0):.2f}]</td></tr>
-    <tr><td>Deflated Sharpe Ratio</td>
-        <td>{dsr.get('deflated_sharpe_ratio',0):.1%} — {dsr.get('interpretation','')}</td></tr>
-    <tr><td>Trials assumed</td><td>{dsr.get('n_trials_assumed','')}</td></tr>
-    <tr><td>Jarque-Bera</td><td>{jb.get('interpretation','')}</td></tr>
-    <tr><td>Tail Ratio</td><td>{advanced_analysis.get('tail_ratio','N/A')}</td></tr>
-    <tr><td>Omega Ratio</td><td>{advanced_analysis.get('omega_ratio','N/A')}</td></tr>
-    <tr><td>Worst Recovery (days)</td><td>{advanced_analysis.get('worst_recovery_days','N/A')}</td></tr>
-    <tr><td>Annual Turnover</td><td>{turnover.get('annual_turnover','N/A')}</td></tr>
-    <tr><td>Est. Capacity (INR)</td><td>{capacity.get('estimated_capacity_inr','N/A')}</td></tr>
-  </table>
-</section>
-<section>
-  <h2>Benchmark Comparison</h2>
-  <table class="data-table">
-    <thead><tr><th>Benchmark</th><th>Strategy</th><th>Benchmark</th><th>Alpha</th></tr></thead>
-    <tbody>{bench_html}</tbody>
-  </table>
-</section>
-"""
-
-        with open(report_path, "r", encoding="utf-8") as f:
-            html = f.read()
-
-        html = html.replace("</main>", extra + "\n</main>")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(html)
-
         chart_dir = self._dirs["charts"]
+        ci = advanced_analysis.get("sharpe_ci", {})
         try:
             from reports.advanced_charts import plot_sharpe_confidence_interval
             fig = plot_sharpe_confidence_interval(
@@ -233,7 +215,7 @@ class ReportGenerator:
         except Exception as exc:
             logger.debug("Advanced chart generation skipped: %s", exc)
 
-        logger.info("Advanced sections appended to %s", report_path)
+        logger.info("Advanced sections included in %s", report_path)
 
     # ──────────────────────────────────────────────────────────────────────
     # HTML REPORT BUILDER
@@ -249,23 +231,11 @@ class ReportGenerator:
         wf_results: Optional[List[dict]],
         strategy_name: str,
         chart_paths: dict,
+        bench_comparisons: Optional[List[dict]] = None,
+        plotly_fragments: Optional[Dict[str, str]] = None,
+        advanced_analysis: Optional[dict] = None,
     ) -> str:
-        """Build a fully self-contained HTML report (base64-embedded images)."""
-
-        def _b64(path: str) -> str:
-            try:
-                with open(path, "rb") as f:
-                    return base64.b64encode(f.read()).decode()
-            except Exception:
-                return ""
-
-        def _img(key: str) -> str:
-            if key not in chart_paths:
-                return ""
-            b64 = _b64(chart_paths[key])
-            if not b64:
-                return ""
-            return f'<img src="data:image/png;base64,{b64}" class="chart-img">'
+        """Build a minimalist standalone HTML report with embedded Plotly charts."""
 
         def _fmt(val, fmt_str: str = ".2%", fallback: str = "N/A") -> str:
             if val is None:
@@ -275,206 +245,226 @@ class ReportGenerator:
             except Exception:
                 return str(val)
 
-        # ── Metric tiles ──────────────────────────────────────────────────
-        tiles_html = _metric_tiles(metrics)
+        bench_comparisons = bench_comparisons or []
+        plotly_fragments = plotly_fragments or {}
+        advanced_analysis = advanced_analysis or {}
 
-        # ── Metrics table ─────────────────────────────────────────────────
-        table_rows = ""
-        labels = {
-            "total_return_pct":   ("Total Return",        ".2%"),
-            "cagr":               ("CAGR",                ".2%"),
-            "sharpe_ratio":       ("Sharpe Ratio",        ".3f"),
-            "sortino_ratio":      ("Sortino Ratio",       ".3f"),
-            "calmar_ratio":       ("Calmar Ratio",        ".3f"),
-            "max_drawdown_pct":   ("Max Drawdown",        ".2%"),
-            "max_dd_peak_date":   ("Peak Date",           "s"),
-            "max_dd_trough_date": ("Trough Date",         "s"),
-            "total_trades":       ("Total Trades",        ".0f"),
-            "win_rate":           ("Win Rate",            ".2%"),
-            "profit_factor":      ("Profit Factor",       ".3f"),
-            "avg_win_loss_ratio": ("Avg Win/Loss Ratio",  ".3f"),
-            "alpha":              ("Alpha (annual)",      ".2%"),
-            "beta":               ("Beta",               ".3f"),
-            "benchmark_cagr":     ("Benchmark CAGR",     ".2%"),
-            "start_date":         ("Start Date",          "s"),
-            "end_date":           ("End Date",            "s"),
-            "start_capital":      ("Start Capital",      ",.0f"),
-            "end_capital":        ("End Capital",        ",.0f"),
-        }
-        for key, (label, fmt_str) in labels.items():
-            val  = metrics.get(key)
-            disp = _fmt(val, fmt_str)
-            row_class = ""
-            if key in ("total_return_pct", "cagr") and val is not None:
-                row_class = 'class="positive"' if val > 0 else 'class="negative"'
-            table_rows += f"<tr {row_class}><td>{label}</td><td>{disp}</td></tr>\n"
+        n_symbols = len(self._config.data.symbols)
+        run_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # ── Trade log table ────────────────────────────────────────────────
+        # ── Hero metrics ──────────────────────────────────────────────────
+        hero = _hero_metrics(metrics, bench_comparisons)
+
+        # ── Benchmark cards ───────────────────────────────────────────────
+        bench_cards = _benchmark_cards(bench_comparisons)
+
+        # ── Stats grid ────────────────────────────────────────────────────
+        stats_html = _stats_grid(metrics, advanced_analysis)
+
+        # ── Plotly chart panels ───────────────────────────────────────────
+        equity_plot = plotly_fragments.get("equity", "")
+        dd_plot = plotly_fragments.get("drawdown", "")
+        monthly_plot = plotly_fragments.get("monthly", "")
+
+        # ── Trade log (collapsed) ─────────────────────────────────────────
         trade_rows = ""
-        for t in sorted(trade_log, key=lambda x: x.get("entry_date", "")):
-            css = "win-row" if t.get("net_pnl", 0) > 0 else "loss-row"
+        for t in sorted(trade_log, key=lambda x: x.get("entry_date", ""))[-200:]:
+            pnl = t.get("net_pnl", 0)
+            css = "pos" if pnl > 0 else "neg"
             trade_rows += (
                 f"<tr class='{css}'>"
                 f"<td>{t.get('symbol','')}</td>"
                 f"<td>{_ts(t.get('entry_date'))}</td>"
                 f"<td>{_ts(t.get('exit_date'))}</td>"
-                f"<td>{t.get('direction','')}</td>"
-                f"<td>{t.get('quantity','')}</td>"
-                f"<td>{_fmt(t.get('entry_price',0),',.2f')}</td>"
-                f"<td>{_fmt(t.get('exit_price',0),',.2f')}</td>"
-                f"<td>{_fmt(t.get('gross_pnl',0),',.2f')}</td>"
-                f"<td>{_fmt(t.get('commission',0),',.2f')}</td>"
-                f"<td>{_fmt(t.get('net_pnl',0),',.2f')}</td>"
-                f"<td>{_fmt(t.get('return_pct',0),'.2%')}</td>"
+                f"<td>{t.get('strategy_id','')[:20]}</td>"
+                f"<td class='num'>{_fmt(t.get('net_pnl',0),',.0f')}</td>"
+                f"<td class='num'>{_fmt(t.get('return_pct',0),'.2%')}</td>"
                 f"</tr>\n"
             )
+        trade_note = ""
+        if len(trade_log) > 200:
+            trade_note = f"<p class='muted'>Showing last 200 of {len(trade_log)} trades.</p>"
 
-        # ── Walk-forward section ───────────────────────────────────────────
+        # ── Walk-forward ──────────────────────────────────────────────────
         wf_section = ""
         if wf_results:
-            df    = _build_wf_report_df(wf_results)
+            df = _build_wf_report_df(wf_results)
             wf_section = (
-                "<h2>Walk-Forward Validation Results</h2>"
-                + df.to_html(index=False, classes="data-table", border=0)
+                "<section class='panel'><h2>Walk-Forward Validation</h2>"
+                + df.to_html(index=False, classes="compact-table", border=0)
+                + "</section>"
             )
 
-        # ── Config section ─────────────────────────────────────────────────
         cfg = self._config
-        cfg_lines = [
-            f"Initial Capital: ₹{cfg.portfolio.initial_capital:,.0f}",
-            f"Strategy: {strategy_name}",
-            f"Date Range: {cfg.data.start_date} → {cfg.data.end_date}",
-            f"Symbols: {', '.join(cfg.data.symbols)}",
-            f"Fast Window: {cfg.strategy.fast_ma_window} | Slow Window: {cfg.strategy.slow_ma_window}",
-            f"Sizing Method: {cfg.portfolio.sizing_method}",
-            f"Risk Per Trade: {cfg.portfolio.risk_per_trade_pct:.1%}",
-            f"Slippage: {cfg.execution.slippage_pct:.4%}",
-            f"Commission: {cfg.execution.commission_pct:.4%}",
-            f"STT: {cfg.execution.stt_pct:.4%}",
-        ]
-        cfg_html = "<br>".join(cfg_lines)
-
-        run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cfg_html = (
+            f"{n_symbols} symbols · {cfg.data.start_date} → {cfg.data.end_date} · "
+            f"₹{cfg.portfolio.initial_capital:,.0f} capital · "
+            f"{cfg.portfolio.sizing_method} sizing · "
+            f"{', '.join(cfg.advanced.ensemble.enabled_strategies)}"
+        )
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Backtest Report — {strategy_name}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{strategy_name} — Research Report</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {{
-      --primary: #1f77b4; --green: #2ca02c; --red: #d62728;
-      --bg: #f8f9fa; --card-bg: #ffffff; --border: #dee2e6;
+      --bg: #f8fafc; --surface: #ffffff; --border: #e2e8f0;
+      --text: #0f172a; --muted: #64748b; --accent: #2563eb;
+      --positive: #059669; --negative: #dc2626;
+      --radius: 12px; --shadow: 0 1px 3px rgba(15,23,42,.06);
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body  {{ font-family: "Segoe UI", Arial, sans-serif; background: var(--bg);
-              color: #333; line-height: 1.55; font-size: 14px; }}
-    header {{ background: var(--primary); color: white; padding: 24px 32px; }}
-    header h1 {{ font-size: 1.8rem; font-weight: 700; }}
-    header p  {{ opacity: 0.85; margin-top: 4px; }}
-    main  {{ max-width: 1400px; margin: 0 auto; padding: 28px 24px; }}
-    section {{ margin-bottom: 36px; }}
-    h2    {{ font-size: 1.15rem; font-weight: 600; color: var(--primary);
-             border-bottom: 2px solid var(--border); padding-bottom: 6px;
-             margin-bottom: 16px; }}
-    .tiles {{ display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }}
-    .tile  {{ background: var(--card-bg); border: 1px solid var(--border);
-              border-radius: 8px; padding: 16px 22px; min-width: 160px;
-              box-shadow: 0 1px 4px rgba(0,0,0,.06); text-align: center; flex: 1; }}
-    .tile .label {{ font-size: .8rem; color: #666; text-transform: uppercase;
-                    letter-spacing: .5px; }}
-    .tile .value {{ font-size: 1.6rem; font-weight: 700; margin-top: 4px; }}
-    .tile.good  .value {{ color: var(--green); }}
-    .tile.bad   .value {{ color: var(--red);   }}
-    .tile.neutral .value {{ color: var(--primary); }}
-    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
-    table.data-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    table.data-table th {{ background: var(--primary); color: white;
-                           padding: 8px 12px; text-align: left; }}
-    table.data-table td {{ padding: 6px 12px; border-bottom: 1px solid var(--border); }}
-    table.data-table tr:nth-child(even) td {{ background: #f2f6fb; }}
-    .win-row  td {{ background: rgba(44,160,44,0.07)  !important; }}
-    .loss-row td {{ background: rgba(214,39,40,0.07)  !important; }}
-    .positive {{ color: var(--green); }}
-    .negative {{ color: var(--red);   }}
-    .chart-img {{ width: 100%; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
-    details summary {{ cursor: pointer; font-weight: 600; color: var(--primary);
-                       padding: 6px 0; user-select: none; }}
-    .meta {{ font-size: .8rem; color: #888; margin-top: 8px; }}
+    body {{
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.5; font-size: 14px;
+    }}
+    .wrap {{ max-width: 1200px; margin: 0 auto; padding: 32px 24px 64px; }}
+    header {{
+      margin-bottom: 32px; padding-bottom: 24px; border-bottom: 1px solid var(--border);
+    }}
+    header h1 {{ font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }}
+    header .meta {{ color: var(--muted); font-size: 0.875rem; margin-top: 6px; }}
+    .hero {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 16px; margin-bottom: 28px;
+    }}
+    .hero-card {{
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow);
+    }}
+    .hero-card .label {{
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); font-weight: 500;
+    }}
+    .hero-card .value {{
+      font-size: 1.75rem; font-weight: 700; margin-top: 4px; letter-spacing: -0.03em;
+    }}
+    .hero-card .sub {{ font-size: 0.8rem; color: var(--muted); margin-top: 2px; }}
+    .hero-card.up .value {{ color: var(--positive); }}
+    .hero-card.down .value {{ color: var(--negative); }}
+    .hero-card.neutral .value {{ color: var(--text); }}
+    .panel {{
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow);
+    }}
+    h2 {{
+      font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted); margin-bottom: 16px;
+    }}
+    .chart-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+    @media (max-width: 900px) {{ .chart-grid {{ grid-template-columns: 1fr; }} }}
+    .chart-box {{ min-height: 280px; }}
+    .bench-grid {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px;
+    }}
+    .bench-card {{
+      border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+      background: #fafbfc;
+    }}
+    .bench-card .name {{ font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; }}
+    .bench-card .row {{
+      display: flex; justify-content: space-between; font-size: 0.8rem;
+      color: var(--muted); margin-top: 4px;
+    }}
+    .bench-card .alpha {{
+      margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+      font-weight: 600; font-size: 0.9rem;
+    }}
+    .bench-card .alpha.pos {{ color: var(--positive); }}
+    .bench-card .alpha.neg {{ color: var(--negative); }}
+    .stats-grid {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1px;
+      background: var(--border); border: 1px solid var(--border); border-radius: 10px;
+      overflow: hidden;
+    }}
+    .stat-cell {{ background: var(--surface); padding: 12px 16px; }}
+    .stat-cell .k {{ font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
+    .stat-cell .v {{ font-size: 0.95rem; font-weight: 600; margin-top: 2px; }}
+    table.compact-table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+    table.compact-table th {{
+      text-align: left; padding: 8px 10px; background: #f1f5f9;
+      font-weight: 600; color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
+    }}
+    table.compact-table td {{ padding: 7px 10px; border-top: 1px solid var(--border); }}
+    table.compact-table tr.pos td:last-child {{ color: var(--positive); }}
+    table.compact-table tr.neg td:last-child {{ color: var(--negative); }}
+    td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    details summary {{
+      cursor: pointer; font-weight: 600; color: var(--accent); padding: 4px 0;
+    }}
+    .muted {{ color: var(--muted); font-size: 0.85rem; }}
+    footer {{ margin-top: 40px; text-align: center; color: var(--muted); font-size: 0.75rem; }}
   </style>
 </head>
 <body>
+<div class="wrap">
 
 <header>
-  <h1>📊 Backtest Report — {strategy_name}</h1>
-  <p>
-    Period: {metrics.get('start_date','—')} → {metrics.get('end_date','—')}
-    &nbsp;|&nbsp; Capital: ₹{metrics.get('start_capital',0):,.0f}
-    &nbsp;|&nbsp; Generated: {run_ts}
+  <h1>{strategy_name}</h1>
+  <p class="meta">
+    {metrics.get('start_date','—')} → {metrics.get('end_date','—')}
+    · {n_symbols} stocks · Generated {run_ts}
   </p>
 </header>
 
-<main>
+{hero}
 
-  <!-- SECTION 1: KEY METRIC TILES -->
-  <section>
-    <h2>Key Performance Metrics</h2>
-    {tiles_html}
+<section class="panel">
+  <h2>Benchmark Comparison</h2>
+  <div class="bench-grid">{bench_cards}</div>
+</section>
+
+<section class="panel">
+  <h2>Performance</h2>
+  <div class="chart-box">{equity_plot}</div>
+</section>
+
+<div class="chart-grid">
+  <section class="panel">
+    <h2>Drawdown</h2>
+    <div class="chart-box">{dd_plot}</div>
   </section>
+  <section class="panel">
+    <h2>Monthly Returns</h2>
+    <div class="chart-box">{monthly_plot}</div>
+  </section>
+</div>
 
-  <!-- SECTION 2: DETAILED METRICS TABLE -->
-  <section>
-    <h2>Detailed Metrics</h2>
-    <div class="two-col">
-      <table class="data-table">
-        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-        <tbody>{table_rows}</tbody>
+<section class="panel">
+  <h2>Risk &amp; Statistics</h2>
+  {stats_html}
+</section>
+
+{wf_section}
+
+<section class="panel">
+  <details>
+    <summary>Trade Log ({len(trade_log)} trades)</summary>
+    {trade_note}
+    <div style="overflow-x:auto; margin-top:12px">
+      <table class="compact-table">
+        <thead><tr>
+          <th>Symbol</th><th>Entry</th><th>Exit</th><th>Strategy</th>
+          <th>Net P&amp;L</th><th>Return</th>
+        </tr></thead>
+        <tbody>{trade_rows}</tbody>
       </table>
     </div>
-  </section>
+  </details>
+  <details style="margin-top:16px">
+    <summary>Configuration</summary>
+    <p class="muted" style="margin-top:8px">{cfg_html}</p>
+  </details>
+</section>
 
-  <!-- SECTION 3: CHARTS -->
-  <section>
-    <h2>Charts</h2>
-    {_img('equity')}
-    {_img('drawdown')}
-    {_img('monthly')}
-    {_img('trades')}
-    {_img('rolling_sharpe')}
-    {_img('walkforward')}
-  </section>
-
-  <!-- SECTION 4: TRADE LOG -->
-  <section>
-    <h2>Trade Log ({len(trade_log)} completed trades)</h2>
-    <div style="overflow-x:auto">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Symbol</th><th>Entry Date</th><th>Exit Date</th>
-          <th>Dir</th><th>Qty</th>
-          <th>Entry ₹</th><th>Exit ₹</th>
-          <th>Gross P&amp;L</th><th>Commission</th>
-          <th>Net P&amp;L</th><th>Return %</th>
-        </tr>
-      </thead>
-      <tbody>{trade_rows}</tbody>
-    </table>
-    </div>
-  </section>
-
-  <!-- SECTION 5: WALK-FORWARD -->
-  {wf_section}
-
-  <!-- SECTION 6: CONFIG -->
-  <section>
-    <details>
-      <summary>Configuration</summary>
-      <p style="margin-top:12px; font-size:13px; line-height:2">{cfg_html}</p>
-    </details>
-  </section>
-
-</main>
+<footer>Quant Research Backtester · {self.run_id}</footer>
+</div>
 </body>
 </html>"""
         return html
@@ -557,6 +547,111 @@ class ReportGenerator:
 # ──────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _hero_metrics(metrics: dict, bench_comparisons: List[dict]) -> str:
+    """Top hero metric cards."""
+    def _pct(v):
+        return f"{v:.2%}" if v is not None else "N/A"
+
+    cagr = metrics.get("cagr", 0) or 0
+    total = metrics.get("total_return_pct", 0) or 0
+    sharpe = metrics.get("sharpe_ratio", 0) or 0
+    alpha = metrics.get("alpha", 0) or 0
+
+    ew_alpha = None
+    for b in bench_comparisons:
+        if "Equal-Weight" in b.get("benchmark_label", "") and "cost-adjusted" in b.get("benchmark_label", ""):
+            ew_alpha = b.get("outperformance")
+            break
+    if ew_alpha is None:
+        for b in bench_comparisons:
+            if "Equal-Weight" in b.get("benchmark_label", ""):
+                ew_alpha = b.get("outperformance")
+                break
+
+    cards = [
+        ("CAGR", _pct(cagr), "Compound annual growth", "up" if cagr > 0.10 else "neutral"),
+        ("Total Return", _pct(total), f"₹{metrics.get('end_capital',0):,.0f} ending value", "up" if total > 0 else "down"),
+        ("Sharpe Ratio", f"{sharpe:.2f}", "Risk-adjusted return", "up" if sharpe > 0.5 else "neutral"),
+        ("Alpha vs Nifty 50", _pct(alpha), "Annual excess return", "up" if alpha > 0 else "down"),
+    ]
+    if ew_alpha is not None:
+        cards.append((
+            "vs Equal-Weight",
+            f"{ew_alpha:+.2%}",
+            "Total return alpha",
+            "up" if ew_alpha > 0 else "down",
+        ))
+
+    html = '<div class="hero">'
+    for label, val, sub, css in cards:
+        html += (
+            f'<div class="hero-card {css}">'
+            f'<div class="label">{label}</div>'
+            f'<div class="value">{val}</div>'
+            f'<div class="sub">{sub}</div></div>'
+        )
+    html += "</div>"
+    return html
+
+
+def _benchmark_cards(bench_comparisons: List[dict]) -> str:
+    """Styled benchmark comparison cards."""
+    if not bench_comparisons:
+        return "<p class='muted'>No benchmark data available.</p>"
+
+    html = ""
+    for b in bench_comparisons:
+        label = b.get("benchmark_label", "")
+        strat = b.get("strategy_total_return", 0)
+        bench = b.get("benchmark_total_return", 0)
+        alpha = b.get("outperformance", 0)
+        css = "pos" if alpha > 0 else "neg"
+        short = label.replace(" Buy & Hold", "").replace(" (cost-adjusted)", " *")
+        html += f"""
+<div class="bench-card">
+  <div class="name">{short}</div>
+  <div class="row"><span>Strategy</span><span>{strat:.2%}</span></div>
+  <div class="row"><span>Benchmark</span><span>{bench:.2%}</span></div>
+  <div class="alpha {css}">Alpha {alpha:+.2%}</div>
+</div>"""
+    return html
+
+
+def _stats_grid(metrics: dict, advanced: dict) -> str:
+    """Compact statistics grid."""
+    dsr = advanced.get("deflated_sharpe", {})
+    ci = advanced.get("sharpe_ci", {})
+    turnover = advanced.get("turnover", {})
+
+    def _fmt(v, f=".2%"):
+        if v is None:
+            return "N/A"
+        try:
+            return format(v, f)
+        except Exception:
+            return str(v)
+
+    cells = [
+        ("Max Drawdown", _fmt(metrics.get("max_drawdown_pct"))),
+        ("Sortino", _fmt(metrics.get("sortino_ratio"), ".2f")),
+        ("Calmar", _fmt(metrics.get("calmar_ratio"), ".2f")),
+        ("Win Rate", _fmt(metrics.get("win_rate"))),
+        ("Profit Factor", _fmt(metrics.get("profit_factor"), ".2f")),
+        ("Beta", _fmt(metrics.get("beta"), ".2f")),
+        ("Total Trades", str(int(metrics.get("total_trades", 0)))),
+        ("Annual Turnover", str(turnover.get("annual_turnover", "N/A"))),
+        ("Deflated Sharpe", _fmt(dsr.get("deflated_sharpe_ratio"))),
+        ("Sharpe CI", f"{ci.get('point',0):.2f} [{ci.get('lower',0):.2f}, {ci.get('upper',0):.2f}]"),
+        ("Tail Ratio", str(advanced.get("tail_ratio", "N/A"))),
+        ("Omega Ratio", str(advanced.get("omega_ratio", "N/A"))),
+    ]
+    html = '<div class="stats-grid">'
+    for k, v in cells:
+        html += f'<div class="stat-cell"><div class="k">{k}</div><div class="v">{v}</div></div>'
+    html += "</div>"
+    return html
+
 
 def _metric_tiles(metrics: dict) -> str:
     """Build the 5 large metric tiles as an HTML string."""

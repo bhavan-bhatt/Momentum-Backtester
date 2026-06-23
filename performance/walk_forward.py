@@ -8,12 +8,14 @@
 import copy
 import itertools
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
+from tqdm import tqdm
 
 from config import BacktestConfig, StrategyConfig
 from engine.strategy import BaseStrategy
@@ -172,7 +174,15 @@ class WalkForwardEngine:
             raise RuntimeError("No walk-forward splits were generated.")
 
         self.split_results = []
-        for i, (tr_s, tr_e, te_s, te_e) in enumerate(self.splits, start=1):
+        split_iter = tqdm(
+            enumerate(self.splits, start=1),
+            total=len(self.splits),
+            desc="Walk-forward splits",
+            unit="split",
+            file=sys.stdout,
+        )
+        for i, (tr_s, tr_e, te_s, te_e) in split_iter:
+            split_iter.set_postfix(test=f"{te_s[:4]}→{te_e[:4]}", refresh=False)
             result = self.run_single_split(tr_s, tr_e, te_s, te_e, strategy_class, i)
             self.split_results.append(result)
 

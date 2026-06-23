@@ -11,3 +11,4 @@ PyYAML>=6.0
 python-dateutil>=2.8.0
 arch>=6.2.0
 yfinance>=0.2.40
+tqdm>=4.66.0

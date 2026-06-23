@@ -10,6 +10,10 @@ import sys
 from collections import deque
 from datetime import datetime
 
+from runtime_checks import check_python_version
+
+check_python_version()
+
 from config_loader import load_config_from_yaml, validate_config
 from data.constituents import ConstituentTracker
 from engine.audit_log import AuditLog
@@ -78,17 +82,24 @@ def _build_ensemble_strategies(config, queue, tracker, regime, audit_log):
     return strategies
 
 
+def _stage(msg: str) -> None:
+    """Print a pipeline stage marker (unbuffered for long runs)."""
+    print(f"\n▶ {msg}", flush=True)
+
+
 def run_full_research_pipeline(config_path: str, with_stability: bool = False) -> None:
     """Orchestrate the complete Phase 2 research pipeline."""
+    _stage(f"Loading config: {config_path}")
     config = load_config_from_yaml(config_path)
     warnings = validate_config(config)
     for w in warnings:
-        print(f"  CONFIG WARNING: {w}")
+        print(f"  CONFIG WARNING: {w}", flush=True)
 
     setup_logging(config)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"research_{run_ts}"
 
+    _stage("Initialising components (constituents, regime, strategies)…")
     tracker = ConstituentTracker(config)
     regime = RegimeFilter(config)
     audit_log = AuditLog(run_id=run_id)
@@ -102,9 +113,10 @@ def run_full_research_pipeline(config_path: str, with_stability: bool = False) -
     strategy_ids = [s.strategy_id for s in strategies]
     ensemble = EnsembleAllocator(config, strategy_ids=strategy_ids)
 
+    _stage("Loading market data (CSV)…")
     data_handler = DataHandler(config, queue)
     portfolio = PortfolioManager(config, queue)
-    portfolio.enable_ensemble_mode()
+    portfolio.enable_ensemble_mode([s.strategy_id for s in strategies])
     execution = AdvancedExecutionHandler(config, queue)
 
     engine = ResearchBacktestEngine(
@@ -118,17 +130,21 @@ def run_full_research_pipeline(config_path: str, with_stability: bool = False) -
         audit_log=audit_log,
     )
 
-    print(f"\n{'='*60}")
-    print(f"  Research run — {len(strategies)} strategy sleeve(s)")
-    print(f"  Config: {config_path}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Research run — {len(strategies)} strategy sleeve(s)", flush=True)
+    print(f"  Symbols  : {', '.join(config.data.symbols)}", flush=True)
+    print(f"  Range    : {config.data.start_date} → {config.data.end_date}", flush=True)
+    print(f"  Config   : {config_path}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
+    _stage("Running ensemble backtest (progress bar below)…")
     results = engine.run()
     equity_curve = results["equity_curve"]
     trade_log = results["trade_log"]
     metrics = results["metrics"]
     benchmark_curve = results["benchmark_curve"]
 
+    _stage("Computing performance metrics & statistical tests…")
     perf = PerformanceMetrics(config)
     returns = perf.calculate_returns(equity_curve)
 
@@ -168,6 +184,19 @@ def run_full_research_pipeline(config_path: str, with_stability: bool = False) -
                         f"Nifty 50 Buy & Hold{label_suffix}",
                     )
                 )
+
+    sec_data = getattr(data_handler, "secondary_benchmark_data", None)
+    if sec_data is not None and len(sec_data) > 1:
+        sec_prices = sec_data["close"]
+        for apply_costs, label_suffix in ((False, ""), (True, " (cost-adjusted)")):
+            bh500 = bench.build_buy_and_hold_curve(sec_prices, apply_costs=apply_costs)
+            bench_comparisons.append(
+                bench.compare(
+                    equity_curve,
+                    bh500,
+                    f"Nifty 500 Buy & Hold{label_suffix}",
+                )
+            )
 
     symbol_prices = {}
     for sym in config.data.symbols:
@@ -226,6 +255,22 @@ def run_full_research_pipeline(config_path: str, with_stability: bool = False) -
         "omega_ratio": omega if omega != float("inf") else None,
     })
 
+    # Curves for embedded Plotly charts in the main report
+    benchmark_curves: dict = {}
+    if benchmark_curve is not None and len(benchmark_curve) > 1:
+        benchmark_curves["Nifty 50"] = benchmark_curve
+    sec_data = getattr(data_handler, "secondary_benchmark_data", None)
+    if sec_data is not None and len(sec_data) > 1:
+        sec_prices = sec_data["close"]
+        bh500 = bench.build_buy_and_hold_curve(sec_prices, apply_costs=False)
+        if len(bh500) > 1:
+            benchmark_curves["Nifty 500"] = bh500
+    if symbol_prices:
+        ew_basket = bench.build_equal_weight_basket_curve(symbol_prices, apply_costs=False)
+        if len(ew_basket) > 1:
+            benchmark_curves["Equal-Weight Basket"] = ew_basket
+
+    _stage("Generating reports & charts…")
     reporter = ReportGenerator(config)
     strategy_label = "Ensemble_" + "_".join(config.advanced.ensemble.enabled_strategies[:3])
     report_path = reporter.generate_all(
@@ -234,6 +279,9 @@ def run_full_research_pipeline(config_path: str, with_stability: bool = False) -
         metrics=metrics,
         benchmark_curve=benchmark_curve,
         strategy_name=strategy_label,
+        bench_comparisons=bench_comparisons,
+        benchmark_curves=benchmark_curves,
+        advanced_analysis=advanced_analysis,
     )
     reporter.generate_advanced_sections(
         report_path=report_path,
