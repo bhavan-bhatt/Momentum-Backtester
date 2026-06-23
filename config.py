@@ -21,8 +21,8 @@ class DataConfig:
         "WIPRO.NS",
     ])
     benchmark_symbol: str = "^NSEI"
-    start_date: str = "2016-01-01"
-    end_date: str = "2022-12-31"
+    start_date: str = "2018-01-01"
+    end_date: str = "2026-12-31"
     price_column: str = "auto"
     max_gap_fill: int = 5
 
