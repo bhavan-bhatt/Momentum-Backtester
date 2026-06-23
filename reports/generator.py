@@ -157,6 +157,84 @@ class ReportGenerator:
 
         return rep_path
 
+    def generate_advanced_sections(
+        self,
+        report_path: str,
+        advanced_analysis: dict,
+        audit_log=None,
+    ) -> None:
+        """Append Phase 2 analysis sections to an existing HTML report."""
+        if not os.path.exists(report_path):
+            logger.warning("Report not found for advanced sections: %s", report_path)
+            return
+
+        dsr = advanced_analysis.get("deflated_sharpe", {})
+        ci = advanced_analysis.get("sharpe_ci", {})
+        jb = advanced_analysis.get("jarque_bera", {})
+        turnover = advanced_analysis.get("turnover", {})
+        capacity = advanced_analysis.get("capacity", {})
+        bench_rows = advanced_analysis.get("benchmark_comparisons", [])
+
+        bench_html = ""
+        for b in bench_rows:
+            bench_html += (
+                f"<tr><td>{b.get('benchmark_label','')}</td>"
+                f"<td>{b.get('strategy_total_return',0):.2%}</td>"
+                f"<td>{b.get('benchmark_total_return',0):.2%}</td>"
+                f"<td>{b.get('outperformance',0):+.2%}</td></tr>"
+            )
+
+        extra = f"""
+<section>
+  <h2>Statistical Significance</h2>
+  <table class="data-table">
+    <tr><td>Bootstrap Sharpe CI</td>
+        <td>{ci.get('point',0):.2f} [{ci.get('lower',0):.2f}, {ci.get('upper',0):.2f}]</td></tr>
+    <tr><td>Deflated Sharpe Ratio</td>
+        <td>{dsr.get('deflated_sharpe_ratio',0):.1%} — {dsr.get('interpretation','')}</td></tr>
+    <tr><td>Trials assumed</td><td>{dsr.get('n_trials_assumed','')}</td></tr>
+    <tr><td>Jarque-Bera</td><td>{jb.get('interpretation','')}</td></tr>
+    <tr><td>Tail Ratio</td><td>{advanced_analysis.get('tail_ratio','N/A')}</td></tr>
+    <tr><td>Omega Ratio</td><td>{advanced_analysis.get('omega_ratio','N/A')}</td></tr>
+    <tr><td>Worst Recovery (days)</td><td>{advanced_analysis.get('worst_recovery_days','N/A')}</td></tr>
+    <tr><td>Annual Turnover</td><td>{turnover.get('annual_turnover','N/A')}</td></tr>
+    <tr><td>Est. Capacity (INR)</td><td>{capacity.get('estimated_capacity_inr','N/A')}</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Benchmark Comparison</h2>
+  <table class="data-table">
+    <thead><tr><th>Benchmark</th><th>Strategy</th><th>Benchmark</th><th>Alpha</th></tr></thead>
+    <tbody>{bench_html}</tbody>
+  </table>
+</section>
+"""
+
+        with open(report_path, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        html = html.replace("</main>", extra + "\n</main>")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        chart_dir = self._dirs["charts"]
+        try:
+            from reports.advanced_charts import plot_sharpe_confidence_interval
+            fig = plot_sharpe_confidence_interval(
+                ci.get("point", 0),
+                ci.get("lower", 0),
+                ci.get("upper", 0),
+                self._config,
+            )
+            path = os.path.join(chart_dir, f"{self.run_id}_sharpe_ci.png")
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception as exc:
+            logger.debug("Advanced chart generation skipped: %s", exc)
+
+        logger.info("Advanced sections appended to %s", report_path)
+
     # ──────────────────────────────────────────────────────────────────────
     # HTML REPORT BUILDER
     # ──────────────────────────────────────────────────────────────────────

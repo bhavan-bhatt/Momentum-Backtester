@@ -1,0 +1,11 @@
+# Cross-sectional momentum research config.
+
+advanced:
+  ensemble:
+    enabled_strategies:
+      - CrossSectionalMomentum
+  cross_sectional:
+    lookback_months: 9
+    top_decile_pct: 0.3
+  statistics:
+    n_strategies_tested: 5

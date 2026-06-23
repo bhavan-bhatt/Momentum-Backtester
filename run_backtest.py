@@ -19,11 +19,17 @@ from config import CONFIG, BacktestConfig
 from engine.backtest import BacktestEngine
 from engine.data_handler import DataHandler
 from engine.execution import ExecutionHandler
+from engine.execution_advanced import AdvancedExecutionHandler
 from engine.portfolio import PortfolioManager
+from engine.regime_filter import RegimeFilter
 from reports.generator import ReportGenerator
 from strategies.combined import CombinedStrategy
+from strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
 from strategies.dual_ma import DualMAStrategy
+from strategies.pairs_stat_arb import PairsStatArbStrategy
 from strategies.rsi_strategy import RSIStrategy
+from strategies.volatility_breakout import VolatilityBreakoutStrategy
+from data.constituents import ConstituentTracker
 
 logger = logging.getLogger(__name__)
 
@@ -60,21 +66,33 @@ def setup_logging(config: BacktestConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _STRATEGY_MAP = {
-    "dual_ma":  DualMAStrategy,
-    "rsi":      RSIStrategy,
-    "combined": CombinedStrategy,
+    "dual_ma":              DualMAStrategy,
+    "rsi":                  RSIStrategy,
+    "combined":             CombinedStrategy,
+    "cross_sectional":      CrossSectionalMomentumStrategy,
+    "pairs_stat_arb":       PairsStatArbStrategy,
+    "volatility_breakout":  VolatilityBreakoutStrategy,
+}
+
+_REGIME_NAMES = {
+    "dual_ma":              "DualMA",
+    "rsi":                  "RSI",
+    "cross_sectional":      "CrossSectionalMomentum",
+    "pairs_stat_arb":       "PairsStatArb",
+    "volatility_breakout":  "VolatilityBreakout",
 }
 
 
-def get_strategy(name: str, config: BacktestConfig, event_queue):
+def get_strategy(name: str, config: BacktestConfig, event_queue, regime_filter=None):
     """
     Factory function — return the correct strategy instance by name.
 
     Parameters
     ----------
-    name        : One of "dual_ma", "rsi", "combined".
+    name        : Strategy key from _STRATEGY_MAP.
     config      : BacktestConfig.
     event_queue : Shared event deque.
+    regime_filter : Optional RegimeFilter for entry gating.
 
     Returns
     -------
@@ -86,7 +104,31 @@ def get_strategy(name: str, config: BacktestConfig, event_queue):
             f"Unknown strategy: '{name}'. "
             f"Valid choices: {list(_STRATEGY_MAP.keys())}"
         )
-    return cls(config, event_queue)
+
+    if cls is CrossSectionalMomentumStrategy:
+        tracker = ConstituentTracker(config)
+        return cls(
+            config,
+            event_queue,
+            constituent_tracker=tracker,
+            regime_filter=regime_filter,
+        )
+
+    if cls in (PairsStatArbStrategy, VolatilityBreakoutStrategy):
+        return cls(config, event_queue, regime_filter=regime_filter)
+
+    strategy = cls(config, event_queue)
+    regime_name = _REGIME_NAMES.get(name.lower())
+    if regime_filter is not None and regime_name:
+        strategy.set_regime_filter(regime_filter, regime_name)
+    return strategy
+
+
+def build_execution(config: BacktestConfig, queue):
+    """Return Phase 1 or advanced execution handler based on config."""
+    if config.advanced.advanced_execution.use_liquidity_aware_slippage:
+        return AdvancedExecutionHandler(config, queue)
+    return ExecutionHandler(config, queue)
 
 
 def get_strategy_class(name: str):
@@ -110,19 +152,23 @@ def run_single_backtest(
 
     Parameters
     ----------
-    strategy_name : "dual_ma", "rsi", or "combined".
+    strategy_name : Strategy key from _STRATEGY_MAP.
     config        : BacktestConfig (defaults to the global CONFIG).
     """
     setup_logging(config)
     logger.info("Starting single backtest — strategy=%s", strategy_name)
 
     # ── Wire components ───────────────────────────────────────────────────
-    queue        = deque()
-    data_handler = DataHandler(config, queue)
-    strategy     = get_strategy(strategy_name, config, queue)
-    portfolio    = PortfolioManager(config, queue)
-    execution    = ExecutionHandler(config, queue)
-    engine       = BacktestEngine(config, data_handler, strategy, portfolio, execution)
+    queue          = deque()
+    data_handler   = DataHandler(config, queue)
+    regime_filter  = RegimeFilter(config)
+    strategy       = get_strategy(strategy_name, config, queue, regime_filter)
+    portfolio      = PortfolioManager(config, queue)
+    execution      = build_execution(config, queue)
+    engine         = BacktestEngine(
+        config, data_handler, strategy, portfolio, execution,
+        regime_filter=regime_filter,
+    )
 
     # ── Run ───────────────────────────────────────────────────────────────
     results = engine.run()
@@ -153,7 +199,7 @@ def run_walk_forward(
 
     Parameters
     ----------
-    strategy_name : "dual_ma", "rsi", or "combined".
+    strategy_name : Strategy key from _STRATEGY_MAP.
     config        : BacktestConfig (defaults to the global CONFIG).
     """
     from performance.walk_forward import WalkForwardEngine

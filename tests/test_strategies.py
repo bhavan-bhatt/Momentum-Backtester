@@ -223,6 +223,27 @@ class TestBaseStrategyPositionState:
         assert strategy._is_long("X") is True
         assert strategy._is_flat("X") is False
 
+    def test_regime_filter_blocks_entry(self, strategy):
+        from engine.regime_filter import RegimeFilter
+        cfg = BacktestConfig()
+        rf = RegimeFilter(cfg)
+        rf.current_regime = "range"
+        strategy.set_regime_filter(rf, "DualMA")
+        event = MarketEvent(timestamp=datetime(2020, 1, 1), symbol="X", close=100.0)
+        strategy._emit_signal("X", event.timestamp, SignalDirection.LONG)
+        assert strategy._is_flat("X") is True
+
+    def test_regime_filter_allows_exit(self, strategy):
+        from engine.regime_filter import RegimeFilter
+        cfg = BacktestConfig()
+        rf = RegimeFilter(cfg)
+        rf.current_regime = "range"
+        strategy.set_regime_filter(rf, "DualMA")
+        strategy.current_positions["X"] = SignalDirection.LONG
+        event = MarketEvent(timestamp=datetime(2020, 1, 1), symbol="X", close=100.0)
+        strategy._emit_signal("X", event.timestamp, SignalDirection.EXIT_LONG)
+        assert strategy._is_flat("X") is True
+
     def test_exit_clears_position(self, strategy):
         event = MarketEvent(timestamp=datetime(2020, 1, 1), symbol="X", close=100.0)
         strategy._emit_signal("X", event.timestamp, SignalDirection.LONG)
@@ -344,3 +365,75 @@ class TestCombinedStrategy:
         s1 = s._calculate_signal_strength(28.0, 110.0, 100.0)  # RSI near oversold
         s2 = s._calculate_signal_strength(10.0, 110.0, 100.0)  # RSI deeply oversold
         assert s2 > s1  # deeper → higher strength
+
+
+class TestCrossSectionalMomentumStrategy:
+    def test_strategy_id(self):
+        from strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+        s = CrossSectionalMomentumStrategy(BacktestConfig(), deque())
+        assert "CrossSectionalMomentum" in s.strategy_id
+
+    def test_rank_and_select_long_only(self):
+        from strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+        cfg = BacktestConfig()
+        cfg.strategy.allow_short = False
+        s = CrossSectionalMomentumStrategy(cfg, deque())
+        scores = {"A": 0.30, "B": 0.20, "C": 0.10, "D": -0.05, "E": -0.10}
+        longs, shorts = s._rank_and_select(scores)
+        assert len(longs) >= 1
+        assert shorts == set()
+
+    def test_no_signal_when_not_trigger_symbol(self):
+        from strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+        cfg = BacktestConfig()
+        queue = deque()
+        s = CrossSectionalMomentumStrategy(cfg, queue)
+        mock = _make_mock_handler([100.0 + i for i in range(250)], symbol="Y")
+        event = MarketEvent(timestamp=datetime(2020, 2, 1), symbol="Y", close=200.0)
+        s.calculate_signals(event, mock)
+        assert len(queue) == 0
+
+    def test_rebalance_emits_signals_for_top_momentum(self):
+        from strategies.cross_sectional_momentum import CrossSectionalMomentumStrategy
+        cfg = BacktestConfig()
+        cfg.data.symbols = ["A", "B", "C", "D", "E"]
+        cfg.advanced.cross_sectional.lookback_months = 3
+        cfg.advanced.cross_sectional.skip_recent_days = 5
+        cfg.advanced.cross_sectional.top_decile_pct = 0.4
+        cfg.strategy.allow_short = False
+        queue = deque()
+        s = CrossSectionalMomentumStrategy(cfg, queue)
+
+        dates = pd.date_range("2018-01-01", periods=300, freq="B")
+        symbol_prices = {
+            "A": np.linspace(100, 200, 300),
+            "B": np.linspace(100, 180, 300),
+            "C": np.linspace(100, 160, 300),
+            "D": np.linspace(100, 140, 300),
+            "E": np.linspace(100, 120, 300),
+        }
+
+        def _latest(sym, n):
+            if sym not in symbol_prices or n > len(dates):
+                return None
+            close = pd.Series(symbol_prices[sym][-n:], index=dates[-n:])
+            return pd.DataFrame({
+                "close": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "open": close,
+                "volume": 1_000_000,
+            })
+
+        mock = MagicMock()
+        mock.get_latest_bars.side_effect = _latest
+
+        event = MarketEvent(
+            timestamp=dates[-1].to_pydatetime(),
+            symbol="A",
+            close=float(symbol_prices["A"][-1]),
+        )
+        s.calculate_signals(event, mock)
+        assert len(queue) > 0
+        long_signals = [e for e in queue if e.direction == SignalDirection.LONG]
+        assert len(long_signals) >= 1

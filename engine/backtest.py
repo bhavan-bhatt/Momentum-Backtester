@@ -47,12 +47,16 @@ class BacktestEngine:
         strategy: BaseStrategy,
         portfolio: PortfolioManager,
         execution: ExecutionHandler,
+        regime_filter=None,
+        ensemble_allocator=None,
     ) -> None:
         self._config    = config
         self.data_handler = data_handler
         self.strategy     = strategy
         self.portfolio    = portfolio
         self.execution    = execution
+        self.regime_filter = regime_filter
+        self.ensemble_allocator = ensemble_allocator
 
         # Single shared queue — injected into all components
         self.event_queue: deque = deque()
@@ -103,6 +107,12 @@ class BacktestEngine:
         # ── MAIN LOOP ─────────────────────────────────────────────────────
         while self.data_handler.has_more_bars():
             self.data_handler.update_bars()
+
+            current_dt = self.data_handler.get_current_datetime()
+            if self.regime_filter is not None and current_dt is not None:
+                self.regime_filter.update(current_dt, self.data_handler)
+            if self.ensemble_allocator is not None and current_dt is not None:
+                self.ensemble_allocator.maybe_rebalance(current_dt)
 
             while self.event_queue:
                 event = self.event_queue.popleft()
@@ -155,6 +165,8 @@ class BacktestEngine:
             self.strategy.calculate_signals(event, self.data_handler)
 
         elif etype == EventType.SIGNAL:
+            if self.ensemble_allocator is not None:
+                event = self.ensemble_allocator.filter_signal(event)
             self.portfolio.process_signal(event, self.data_handler)
 
         elif etype == EventType.ORDER:

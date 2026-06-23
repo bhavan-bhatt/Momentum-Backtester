@@ -45,6 +45,11 @@ class PortfolioManager:
         self.equity_curve:     List[tuple]             = []
         self.trade_log:        List[dict]              = []
         self._pending_orders:  Dict[str, "OrderEvent"] = {}
+        self._ensemble_enabled: bool = False
+
+    def enable_ensemble_mode(self) -> None:
+        """Use signal.strength as a capital weight multiplier when sizing entries."""
+        self._ensemble_enabled = True
 
     # ──────────────────────────────────────────────────────────────────────
     # SIGNAL → ORDER
@@ -184,6 +189,11 @@ class PortfolioManager:
 
         if qty <= 0:
             return 0
+
+        if self._ensemble_enabled:
+            qty = int(qty * max(0.0, min(1.0, signal.strength)))
+            if qty <= 0:
+                return 0
 
         # Cash sufficiency
         if qty * current_price > self.cash:

@@ -1,0 +1,18 @@
+# Single-strategy research config — Dual MA with regime filter and advanced stats.
+
+data:
+  start_date: "2016-01-01"
+  end_date: "2022-12-31"
+
+strategy:
+  fast_ma_window: 20
+  slow_ma_window: 50
+
+advanced:
+  ensemble:
+    enabled_strategies:
+      - DualMA
+    weighting_method: equal_weight
+  statistics:
+    bootstrap_n_iterations: 1000
+    n_strategies_tested: 4

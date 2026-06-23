@@ -42,6 +42,18 @@ class BaseStrategy(ABC):
         self.strategy_id  = "BaseStrategy"
         # Keyed by symbol; None = flat, SignalDirection = open direction
         self.current_positions: dict = {}
+        self._regime_filter = None
+        self._regime_name: Optional[str] = None
+        self.audit_log = None
+
+    def set_regime_filter(self, regime_filter, strategy_name: str) -> None:
+        """Attach optional regime filter for entry gating."""
+        self._regime_filter = regime_filter
+        self._regime_name = strategy_name
+
+    def set_audit_log(self, audit_log) -> None:
+        """Attach optional audit log for structured decision recording."""
+        self.audit_log = audit_log
 
     # ──────────────────────────────────────────────────────────────────────
     # ABSTRACT INTERFACE
@@ -77,6 +89,8 @@ class BaseStrategy(ABC):
         timestamp,
         direction: SignalDirection,
         strength: float = 1.0,
+        reason: str = "",
+        values: Optional[dict] = None,
     ) -> None:
         """
         Build a SignalEvent, update position state, and push into the event queue.
@@ -87,7 +101,19 @@ class BaseStrategy(ABC):
         timestamp : datetime
         direction : SignalDirection
         strength  : float ∈ [0, 1]
+        reason    : Optional human-readable explanation for audit log
+        values    : Optional numeric values dict for audit log
         """
+        if direction in (SignalDirection.LONG, SignalDirection.SHORT):
+            if self._regime_filter is not None and self._regime_name:
+                if not self._regime_filter.is_active(self._regime_name):
+                    logger.debug(
+                        "[%s] Entry blocked — regime inactive for %s.",
+                        self.strategy_id,
+                        self._regime_name,
+                    )
+                    return
+
         signal = SignalEvent(
             timestamp=timestamp,
             symbol=symbol,
@@ -102,6 +128,17 @@ class BaseStrategy(ABC):
             self.current_positions[symbol] = None
 
         self._event_queue.append(signal)
+
+        if self.audit_log is not None:
+            self.audit_log.record(
+                timestamp=timestamp,
+                event_type="SIGNAL",
+                symbol=symbol,
+                strategy_id=self.strategy_id,
+                reason=reason or f"{direction.value} signal",
+                values=values or {},
+            )
+
         logger.debug(
             "[%s] %s → %s @ %s (strength=%.2f)",
             self.strategy_id, symbol, direction.value,

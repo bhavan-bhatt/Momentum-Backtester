@@ -1,0 +1,28 @@
+data:
+  symbols:
+    - RELIANCE.NS
+    - INFY.NS
+    - TCS.NS
+    - HDFCBANK.NS
+    - WIPRO.NS
+  benchmark_symbol: "^NSEI"
+  start_date: "2016-01-01"
+  end_date: "2022-12-31"
+
+strategy:
+  fast_ma_window: 20
+  slow_ma_window: 50
+  allow_short: false
+
+advanced:
+  ensemble:
+    enabled_strategies:
+      - DualMA
+      - RSI
+      - CrossSectionalMomentum
+      - VolatilityBreakout
+    weighting_method: equal_vol
+  statistics:
+    n_strategies_tested: 6
+  constituents:
+    enforce_point_in_time: true

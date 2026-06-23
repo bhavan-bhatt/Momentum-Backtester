@@ -1,0 +1,18 @@
+# Full ensemble research config.
+
+strategy:
+  allow_short: false
+
+advanced:
+  ensemble:
+    enabled_strategies:
+      - DualMA
+      - RSI
+      - CrossSectionalMomentum
+      - VolatilityBreakout
+    weighting_method: equal_vol
+    max_sleeve_weight: 0.5
+  statistics:
+    n_strategies_tested: 8
+  advanced_execution:
+    use_liquidity_aware_slippage: true

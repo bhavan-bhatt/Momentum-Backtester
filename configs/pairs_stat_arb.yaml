@@ -1,0 +1,22 @@
+# Pairs stat-arb config — requires allow_short and both leg CSVs.
+
+strategy:
+  allow_short: true
+
+data:
+  symbols:
+    - HDFCBANK.NS
+    - RELIANCE.NS
+    - INFY.NS
+    - TCS.NS
+    - WIPRO.NS
+
+advanced:
+  ensemble:
+    enabled_strategies:
+      - PairsStatArb
+  pairs:
+    candidate_pairs:
+      - [HDFCBANK.NS, RELIANCE.NS]
+  statistics:
+    n_strategies_tested: 3
